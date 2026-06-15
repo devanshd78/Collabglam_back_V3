@@ -20,6 +20,18 @@ const ContractDocument = require("../models/contractDocument");
 const BrandSignature = require("../models/brandSignature");
 const InfluencerSignature = require("../models/influencerSignature");
 
+const {
+  CONTRACT_BUCKET,
+  CONTRACT_FOLDER,
+  createContractUploadUrl,
+  getContractObjectStream,
+  getExpectedContractKeyPrefix,
+  deleteContractFile,
+  assertPdfUpload,
+} = require("../services/s3Contract.service");
+
+const UPLOADED_CONTRACT_ACKNOWLEDGEMENT = require("../template/UploadedContractAcknowledgement");
+
 const MASTER_TEMPLATE = require("../template/ContractTemplate");
 const { createAndEmit } = require("../utils/notifier");
 const saveErrorLog = require("../services/errorLog.service");
@@ -2071,19 +2083,86 @@ async function createContractRecord({ req, brandId, influencerId, campaignId, ca
 }
 
 async function renderHydratedContractPdf({ contract, res, filename }) {
+  const document = await ContractDocument.findOne({
+    contractId: contract.contractId,
+  }).lean();
+
+  const isUploaded =
+    contract.contractSource === "uploaded" ||
+    document?.documentSource === "uploaded";
+
+  if (isUploaded) {
+    const upload = document?.uploadedContract || {};
+
+    if (!upload.key) {
+      const error = new Error("Uploaded contract file is missing.");
+      error.status = 404;
+      throw error;
+    }
+
+    const s3Object = await getContractObjectStream(upload.key);
+
+    const safeFileName = String(
+      upload.originalName || filename || "Contract.pdf"
+    )
+      .replace(/"/g, "")
+      .trim();
+
+    res.setHeader("Content-Type", s3Object.ContentType || "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename="${safeFileName}"`);
+
+    if (s3Object.ContentLength) {
+      res.setHeader("Content-Length", String(s3Object.ContentLength));
+    }
+
+    s3Object.Body.on("error", (streamErr) => {
+      console.error("[Contract] S3 PDF stream failed:", streamErr);
+
+      if (!res.headersSent) {
+        res.status(500).json({
+          success: false,
+          message: "Could not stream uploaded contract.",
+        });
+      } else {
+        res.destroy(streamErr);
+      }
+    });
+
+    return s3Object.Body.pipe(res);
+  }
+
   const hydrated = await hydrateContract(contract);
-  const tokens = hydrated.lockedAt && hydrated.renderedTextSnapshot ? hydrated.templateTokensSnapshot || buildTokenMap(hydrated) : buildTokenMap(hydrated);
-  const text = hydrated.lockedAt && hydrated.renderedTextSnapshot ? hydrated.renderedTextSnapshot : renderTemplate(hydrated.admin?.legalTemplateText || MASTER_TEMPLATE, tokens);
-  const html = renderContractHTML({ contract: hydrated, templateText: text });
+
+  const tokens =
+    hydrated.lockedAt && hydrated.renderedTextSnapshot
+      ? hydrated.templateTokensSnapshot || buildTokenMap(hydrated)
+      : buildTokenMap(hydrated);
+
+  const text =
+    hydrated.lockedAt && hydrated.renderedTextSnapshot
+      ? hydrated.renderedTextSnapshot
+      : renderTemplate(
+          hydrated.admin?.legalTemplateText || MASTER_TEMPLATE,
+          tokens
+        );
+
+  const html = renderContractHTML({
+    contract: hydrated,
+    templateText: text,
+  });
+
   return renderPDFWithPuppeteer({
     html,
     res,
     filename,
     headerTitle: CONTRACT_PDF_TITLE,
-    headerDate: tokens["Agreement.EffectiveDateTime"] || tokens["Agreement.EffectiveDateLong"] || tokens["Agreement.EffectiveDate"] || "Pending",
+    headerDate:
+      tokens["Agreement.EffectiveDateTime"] ||
+      tokens["Agreement.EffectiveDateLong"] ||
+      tokens["Agreement.EffectiveDate"] ||
+      "Pending",
   });
 }
-
 
 exports.getSendContractRequirements = async (req, res) => {
   try {
@@ -2956,5 +3035,368 @@ exports.getContractDetails = async (req, res) => {
   } catch (err) {
     await saveErrorLog(req, err, err?.status || err?.statusCode || 500, "GET_CONTRACT_DETAILS_ERROR");
     return respondError(res, "Error fetching contract details", 500, err);
+  }
+};
+
+exports.getOwnContractUploadUrl = async (req, res) => {
+  try {
+    const {
+      brandId,
+      influencerId,
+      campaignId,
+      fileName,
+      contentType,
+      sizeBytes,
+    } = req.body;
+
+    assertRequired(req.body, [
+      "brandId",
+      "influencerId",
+      "campaignId",
+      "fileName",
+      "contentType",
+      "sizeBytes",
+    ]);
+
+    if (!mongoose.Types.ObjectId.isValid(campaignId)) {
+      return respondError(res, "Invalid campaignId", 400);
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(brandId)) {
+      return respondError(res, "Invalid brandId", 400);
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(influencerId)) {
+      return respondError(res, "Invalid influencerId", 400);
+    }
+
+    const [campaign, brandDoc, influencerDoc] = await Promise.all([
+      Campaign.findById(campaignId).select("_id").lean(),
+      Brand.findById(brandId).select("_id").lean(),
+      Influencer.findById(influencerId).select("_id").lean(),
+    ]);
+
+    if (!campaign) return respondError(res, "Campaign not found", 404);
+    if (!brandDoc) return respondError(res, "Brand not found", 404);
+    if (!influencerDoc) return respondError(res, "Influencer not found", 404);
+
+    const upload = await createContractUploadUrl({
+      brandId,
+      influencerId,
+      campaignId,
+      fileName,
+      contentType,
+      sizeBytes,
+    });
+
+    return respondOK(res, {
+      message: "Contract upload URL created",
+      upload,
+    });
+  } catch (err) {
+    await saveErrorLog(
+      req,
+      err,
+      err?.status || err?.statusCode || 500,
+      "OWN_CONTRACT_UPLOAD_URL_ERROR"
+    );
+
+    return respondError(
+      res,
+      err.message || "Could not create contract upload URL",
+      err.status || 500,
+      err
+    );
+  }
+};
+
+exports.sendUploadedOwnContract = async (req, res) => {
+  let uploadedKey = "";
+  let shouldDeleteUploadedObject = true;
+
+  try {
+    const {
+      brandId,
+      influencerId,
+      campaignId,
+      requestedEffectiveDate,
+      requestedEffectiveDateTimezone,
+      uploadedContract,
+      isResend = false,
+      resendOf = "",
+    } = req.body;
+
+    assertRequired(req.body, ["brandId", "influencerId", "campaignId"]);
+
+    assertRequired(uploadedContract || {}, [
+      "key",
+      "bucket",
+      "originalName",
+      "mimeType",
+      "sizeBytes",
+    ]);
+
+    uploadedKey = uploadedContract.key;
+
+    if (!mongoose.Types.ObjectId.isValid(campaignId)) {
+      return respondError(res, "Invalid campaignId", 400);
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(brandId)) {
+      return respondError(res, "Invalid brandId", 400);
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(influencerId)) {
+      return respondError(res, "Invalid influencerId", 400);
+    }
+
+    if (uploadedContract.bucket !== CONTRACT_BUCKET) {
+      return respondError(res, "Invalid contract S3 bucket.", 400);
+    }
+
+    const expectedKeyPrefix = getExpectedContractKeyPrefix({
+      brandId,
+      campaignId,
+      influencerId,
+    });
+
+    if (!String(uploadedContract.key || "").startsWith(expectedKeyPrefix)) {
+      return respondError(res, "Invalid contract S3 key.", 400);
+    }
+
+    assertPdfUpload({
+      fileName: uploadedContract.originalName,
+      contentType: uploadedContract.mimeType,
+      sizeBytes: uploadedContract.sizeBytes,
+    });
+
+    const [campaign, brandDoc, influencerDoc] = await Promise.all([
+      Campaign.findById(campaignId),
+      Brand.findById(brandId),
+      Influencer.findById(influencerId),
+    ]);
+
+    if (!campaign) return respondError(res, "Campaign not found", 404);
+    if (!brandDoc) return respondError(res, "Brand not found", 404);
+    if (!influencerDoc) return respondError(res, "Influencer not found", 404);
+
+    const admin = buildAdmin({
+      campaign,
+      requestedEffectiveDateTimezone,
+      req,
+    });
+
+    const other = buildOtherProfile({
+      brandDoc,
+      influencerDoc,
+    });
+
+    const content = createDefaultContent({
+      campaign,
+      brandDoc,
+      influencerDoc,
+      admin,
+      requestedEffectiveDate,
+      requestedEffectiveDateTimezone,
+      contentInput: {},
+    });
+
+    let parent = null;
+
+    if (isResend && resendOf) {
+      parent = await Contract.findOne({ contractId: resendOf });
+
+      if (!parent) {
+        return respondError(res, "resendOf contract not found", 404);
+      }
+
+      if (
+        String(parent.brandId) !== String(brandId) ||
+        String(parent.influencerId) !== String(influencerId) ||
+        String(parent.campaignId) !== String(campaignId)
+      ) {
+        return respondError(
+          res,
+          "resendOf must belong to the same brand, influencer, and campaign",
+          400
+        );
+      }
+
+      if (isLockedContract(parent)) {
+        return respondError(res, "Cannot resend a signed/locked contract", 400);
+      }
+    }
+
+    const contract = await createContractRecord({
+      req,
+      brandId,
+      influencerId,
+      campaignId,
+      campaign,
+      brandDoc,
+      influencerDoc,
+      content,
+      other,
+      admin,
+      requestedEffectiveDate,
+      requestedEffectiveDateTimezone,
+      signatureBrand: "",
+      signatureId: "",
+      resendOf: parent?.contractId || null,
+      resendIteration: parent ? Number(parent.resendIteration || 0) + 1 : 0,
+    });
+
+    contract.contractSource = "uploaded";
+    contract.status = CONTRACT_STATUS.BRAND_SENT_DRAFT;
+    contract.awaitingRole = "influencer";
+    contract.lastSentAt = new Date();
+    await contract.save();
+
+    await ContractDocument.findOneAndUpdate(
+      { contractId: contract.contractId },
+      {
+        $set: {
+          documentSource: "uploaded",
+          pdfUrl: "",
+          uploadedContract: {
+            originalName: uploadedContract.originalName,
+            bucket: CONTRACT_BUCKET,
+            folder: CONTRACT_FOLDER,
+            key: uploadedContract.key,
+            mimeType: "application/pdf",
+            sizeBytes: Number(uploadedContract.sizeBytes || 0),
+            uploadedBy:
+              req.user?.id ||
+              req.user?._id ||
+              req.user?.email ||
+              String(brandId),
+            uploadedAt: new Date(),
+          },
+          acknowledgement: {
+            version: 1,
+            title: "CollabGlam Uploaded Contract Acknowledgement",
+            text: UPLOADED_CONTRACT_ACKNOWLEDGEMENT,
+            appliesToUploadedContract: true,
+          },
+        },
+      },
+      { upsert: true, new: true }
+    );
+
+    shouldDeleteUploadedObject = false;
+
+    if (parent) {
+      parent.supersededBy = contract.contractId;
+      parent.resentAt = new Date();
+      parent.status = CONTRACT_STATUS.SUPERSEDED;
+      parent.statusFlags = parent.statusFlags || {};
+      parent.statusFlags.isSuperseded = true;
+
+      await addActivity(parent, "system", "RESENT", {
+        to: contract.contractId,
+        by: req.user?.email || "system",
+      });
+
+      await parent.save();
+    }
+
+    await addActivity(contract, "brand", "UPLOADED_OWN_CONTRACT", {
+      bucket: CONTRACT_BUCKET,
+      folder: CONTRACT_FOLDER,
+      key: uploadedContract.key,
+      originalName: uploadedContract.originalName,
+      sizeBytes: uploadedContract.sizeBytes,
+      mimeType: uploadedContract.mimeType,
+      acknowledgementVersion: 1,
+    });
+
+    await syncApplyCampaignAfterSend(contract, true);
+    await syncApplyCampaignAfterSend(contract, false);
+
+    await Campaign.updateOne(campaignQuery(campaignId), {
+      $set: {
+        isContracted: 1,
+        contractId: contract.contractId,
+        isAccepted: 0,
+      },
+    });
+
+    await createAndEmit({
+      recipientType: "influencer",
+      influencerId: String(influencerId),
+      type: "contract.initiated",
+      title: `Contract initiated by ${brandDoc.name || "Brand"}`,
+      message: `Brand uploaded a contract for "${
+        campaign.productOrServiceName || campaign.campaignTitle || "Campaign"
+      }". Please review the uploaded contract and CollabGlam acknowledgement.`,
+      entityType: "contract",
+      entityId: String(contract.contractId),
+      actionPath: "/influencer/my-campaign",
+      meta: { campaignId, brandId, influencerId },
+    });
+
+    await createAndEmit({
+      recipientType: "brand",
+      brandId: String(brandId),
+      type: "contract.initiated.self",
+      title: parent ? "Contract resent" : "Contract uploaded",
+      message: `You uploaded and sent a contract to ${
+        influencerDoc.name || "Influencer"
+      }.`,
+      entityType: "contract",
+      entityId: String(contract.contractId),
+      actionPath: `/brand/created-campaign/applied-inf?id=${campaignId}`,
+      meta: { campaignId, influencerId },
+    });
+
+    const hydrated = await hydrateContract(contract);
+
+    await safeSendEmail({
+      contract: hydrated,
+      templateKey: "contract_new_received_influencer",
+      to: getEmailForRole({
+        contract: hydrated,
+        role: "influencer",
+        influencerDoc,
+      }),
+      recipientRole: "influencer",
+      recipientName: getNameForRole({
+        contract: hydrated,
+        role: "influencer",
+        influencerDoc,
+      }),
+    });
+
+    await safeStartReminder(contract, "influencer");
+    await safeClearReminder(contract.contractId, "brand");
+
+    return respondOK(
+      res,
+      {
+        message: parent
+          ? "Uploaded contract resent successfully"
+          : "Uploaded contract sent successfully",
+        contract: hydrated,
+      },
+      201
+    );
+  } catch (err) {
+    if (shouldDeleteUploadedObject && uploadedKey) {
+      await deleteContractFile(uploadedKey).catch(() => null);
+    }
+
+    await saveErrorLog(
+      req,
+      err,
+      err?.status || err?.statusCode || 500,
+      "SEND_UPLOADED_OWN_CONTRACT_ERROR"
+    );
+
+    return respondError(
+      res,
+      err.message || "send uploaded own contract error",
+      err.status || 500,
+      err
+    );
   }
 };

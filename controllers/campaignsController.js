@@ -145,7 +145,6 @@ const mapCampaignForDisputeDropdown = (campaign) => {
     budget: campaign.budget,
     applicantCount: campaign.applicantCount,
 
-    platformSelection: campaign.platformSelection || [],
     productImages: campaign.productImages || [],
 
     byAi: campaign.byAi,
@@ -353,15 +352,6 @@ const pickStatus = (v) => {
   const allowed = ["draft", "scheduled", "active", "paused", "completed", "archived"];
   const s = clean(v);
   return allowed.includes(s) ? s : "draft";
-};
-
-const toPlatformArray = (v) => {
-  const allowed = ["youtube", "instagram", "tiktok"];
-  const raw = Array.isArray(v) ? v : typeof v === "string" ? [v] : [];
-  const out = raw
-    .map((x) => clean(String(x)).toLowerCase())
-    .filter((x) => allowed.includes(x));
-  return [...new Set(out)];
 };
 
 const resolveCategoryAndSubcategories = async (categoryId, subIds) => {
@@ -843,7 +833,6 @@ const validateForMode = async (res, requestId, mode, body, opts = {}) => {
       brandId: brandIdR.value,
       rel: null,
       normalized: {
-        platformSelection: toPlatformArray(body.platformSelection),
         paymentType: clean(body.paymentType) ? normalizePaymentType(body.paymentType) : undefined,
       },
     };
@@ -972,14 +961,6 @@ const validateForMode = async (res, requestId, mode, body, opts = {}) => {
     };
   }
 
-  const ps = toPlatformArray(body.platformSelection);
-  if (!ps.length) {
-    return {
-      ok: false,
-      resp: failField(res, HttpStatus.BAD_REQUEST, "VALIDATION_ERROR", "platformSelection", requestId),
-    };
-  }
-
   const countriesR = requireIdArray(res, requestId, "targetCountryIds", body.targetCountryIds);
   if (!countriesR.ok) return { ok: false, resp: countriesR.resp };
 
@@ -1006,7 +987,6 @@ const validateForMode = async (res, requestId, mode, body, opts = {}) => {
     brandId: brandIdR.value,
     rel,
     normalized: {
-      platformSelection: toPlatformArray(body.platformSelection),
       paymentType: normalizePaymentType(body.paymentType),
     },
   };
@@ -1126,11 +1106,6 @@ const buildCampaignDoc = (body, geo, status, byAi, timing, extra = {}) => {
 
     paymentType: clean(body.paymentType) ? normalizePaymentType(body.paymentType) : "Milestone",
 
-    platformSelection: (() => {
-      const ps = toPlatformArray(body.platformSelection);
-      return isDraft ? (ps.length ? ps : undefined) : ps;
-    })(),
-
     additionalNotes: isDraft ? strOrUndef(body.additionalNotes) : clean(body.additionalNotes) || "",
 
     isDraft: status === "draft" ? 1 : 0,
@@ -1215,10 +1190,6 @@ const buildCampaignUpdatePatch = (body, existing, status, timing, extra = {}) =>
     contentFormats: toOidArrayOrFallback(body.contentFormats, existing.contentFormats || []),
     contentLanguageIds: toOidArrayOrFallback(body.contentLanguageIds, existing.contentLanguageIds || []),
     preferredHashtags: toOidArrayOrFallback(body.preferredHashtags, existing.preferredHashtags || []),
-
-    platformSelection: toPlatformArray(body.platformSelection).length
-      ? toPlatformArray(body.platformSelection)
-      : existing.platformSelection || [],
 
     targetCountryIds: toOidArrayOrFallback(body.targetCountryIds, existing.targetCountryIds || []),
     targetAgeRanges: toOidArrayOrFallback(body.targetAgeRanges, existing.targetAgeRanges || []),
@@ -1896,57 +1867,142 @@ exports.createCampaign = async (req, res) => {
 // ===============================
 // AI PREFILL
 // ===============================
+// ===============================
+// AI PREFILL
+// ===============================
 const buildAIPrompt = (ui) => `
-You are an expert campaign strategist for influencer marketing.
-Your job: infer missing MANUAL form fields from the given Please Fill the Required Fields.
+You are an expert influencer marketing campaign strategist.
 
-STRICT RULES:
-- Output MUST be ONLY valid JSON (no markdown, no explanations).
-- DO NOT change any source IDs (categoryId, subcategoryIds, targetCountryIds, targetAgeRanges).
-- For fields that require IDs, you MUST pick IDs ONLY from allowedOptions lists.
-- Always include ALL JSON keys listed in "Output JSON keys".
-- If unsure, pick reasonable defaults.
+The user is creating a campaign through an AI prompt box.
+The frontend may send:
+- description / campaignPrompt
+- productLink
+- uploaded productImages metadata and image URLs
 
-REQUIRED MANUAL FIELDS TO FILL:
-- campaignGoals (>=1)
-- influencerTierIds (>=1)
-- contentFormats (>=1)
-- platformSelection (>=1) only from: youtube, instagram, tiktok
-- paymentType one of: Milestone, Fixed, Gifting
-- campaignBudget >= 0 (integer)
-- numberOfInfluencers >= 1 (integer)
-- startAt / endAt: ISO local datetime WITHOUT timezone offset. Example: "2026-02-04T09:00"
-  Ensure endAt > startAt. Prefer startAt tomorrow 09:00 and endAt 7-14 days later.
+Your job is to generate a COMPLETE campaign prefill that aligns 1:1 with the MANUAL campaign form and backend campaign schema.
 
-OPTIONAL FIELDS (may be empty):
-- minFollowers
-- maxFollowers
-- contentLanguageIds
-- preferredHashtags
-- additionalNotes
-- campaignType
+IMPORTANT ASSET RULES:
+- DO NOT invent image URLs.
+- DO NOT remove, rewrite, rename, or replace productImages.
+- DO NOT output productImages.
+- Product images are already uploaded and will be preserved by backend.
+- Use product image visual context only to infer product category, campaign title, tone, audience, YouTube content formats, and creator requirements.
+- If a productLink is provided, use it as context only. Backend will preserve productLink directly.
+- Never create fake links, fake video links, fake image URLs, or fake attachment URLs.
 
-DESCRIPTION ENHANCEMENT:
-- Create an improved, brand-friendly, clear, polished "enhancedDescription" using the source description.
-- Keep it concise, structured, and suitable for influencers.
+PLATFORM RULE:
+- This product is now fixed to YouTube only.
+- Do NOT output any platform field.
+- Do NOT choose Instagram or TikTok.
+- Content formats, deliverables, creator requirements, and additionalNotes should be optimized for YouTube.
 
-Output JSON keys (ALL of these must exist, even if empty arrays/blank strings):
-enhancedTitle,
-enhancedDescription,
-campaignGoals,
-influencerTierIds,
-contentFormats,
-contentLanguageIds,
-preferredHashtags,
-platformSelection,
-paymentType,
-campaignBudget,
-numberOfInfluencers,
-minFollowers,
-maxFollowers,
-startAt,
-endAt,
-additionalNotes
+STRICT OUTPUT RULES:
+- Output MUST be ONLY valid JSON.
+- No markdown.
+- No comments.
+- No explanations.
+- Always include ALL output keys listed below.
+- For ID fields, return ONLY IDs from allowedOptions.
+- Never return labels/names where IDs are required.
+- Never return objects where string IDs are required.
+- If unsure, pick the closest safe default from allowedOptions.
+- Prefer 1 strong category and 1-3 relevant subcategories.
+- Prefer realistic campaign values that can pass manual form validation.
+
+MANUAL CAMPAIGN FIELD ALIGNMENT:
+
+1. Product / Service Info
+- campaignTitle: short, clear, brand-facing campaign title.
+- enhancedDescription: polished influencer-facing description generated from user prompt, product link, and images.
+- campaignType: one of common manual types if inferable: Paid, Gifting, Affiliate, Ambassador, Event, UGC Only, Sponsored, Paid + Bonus.
+- categoryId: MUST be one id from allowedOptions.categories.
+- subcategoryIds: MULTI-SELECT. Pick 1 to 3 relevant ids from the selected category's subcategories.
+- productLink is source context only. Backend preserves it.
+- productImages are source context only. Backend preserves uploaded image objects.
+
+2. Campaign Goals
+- campaignGoals: MULTI-SELECT. Pick 1 to 3 ids from allowedOptions.campaignGoals.
+- Pick goals that match the product, audience, and YouTube campaign objective.
+
+3. Creator Requirements
+- numberOfInfluencers: integer >= 1.
+- influencerTierIds: MULTI-SELECT. Pick 1 to 3 ids from allowedOptions.influencerTiers.
+- minFollowers and maxFollowers:
+  - Use realistic values aligned with selected influencer tier.
+  - If unknown, use 0 for both.
+  - If provided, maxFollowers must be >= minFollowers.
+  - Do not use values below backend minimum unless both are 0.
+- contentFormats: MULTI-SELECT. Pick 1 to 4 ids from allowedOptions.contentFormats.
+- Prefer YouTube-friendly content formats such as long-form videos, Shorts, reviews, tutorials, unboxing, product demos, integrations, or UGC where available.
+- contentLanguageIds: choose ids from allowedOptions.contentLanguages when useful; otherwise [].
+
+4. Timeline & Payments
+- paymentType: MUST be one of: Milestone, Fixed, Gifting.
+- campaignBudget: integer >= 0.
+- If campaign is gifting-only, budget can be 0.
+- If paid/sponsored, choose a realistic positive budget.
+- startAt and endAt:
+  - ISO local datetime WITHOUT timezone offset.
+  - Format: "yyyy-MM-dd'T'HH:mm"
+  - Use guidance.datetimeFormat.
+  - Ensure endAt > startAt.
+  - Prefer startAt tomorrow at 09:00.
+  - Prefer endAt 7-14 days after startAt.
+
+5. Audience
+- targetCountryIds: MULTI-SELECT. Pick 1 to 4 ids from allowedOptions.targetCountries.
+- targetAgeRanges: MULTI-SELECT. Pick 1 to 4 ids from allowedOptions.targetAgeRanges.
+- preferredHashtags: choose ids from allowedOptions.preferredHashtags when available and relevant; otherwise [].
+
+6. Additional Notes
+- additionalNotes should summarize:
+  - YouTube creator style direction
+  - product/image observations if image context exists
+  - product link/reference usage if productLink exists
+  - key YouTube deliverables or campaign angle
+- Keep it concise and useful for the manual campaign review screen.
+
+CATEGORY SELECTION RULES:
+- categoryId MUST be from allowedOptions.categories[*].id.
+- subcategoryIds MUST be from the selected category's subcategories only.
+- If the prompt or images clearly show a product type, choose the closest matching category/subcategory.
+- If the product is broad/unclear, choose the safest general category available.
+
+IMAGE REASONING RULES:
+- If images are provided, infer what the product appears to be.
+- Use image filenames, content types, and visual image inputs if available.
+- Mention useful product/image observations only in enhancedDescription or additionalNotes.
+- Do not put image URLs in additionalNotes unless directly useful.
+- Do not output productImages in JSON.
+
+PRODUCT LINK RULES:
+- Use productLink to infer product/category/campaign angle when available.
+- Do not output productLink in JSON; backend preserves it.
+- Do not invent link summaries if link content is not accessible.
+
+Output JSON keys:
+{
+  "campaignTitle": "",
+  "enhancedDescription": "",
+  "campaignType": "",
+  "categoryId": "",
+  "subcategoryIds": [],
+  "targetCountryIds": [],
+  "targetAgeRanges": [],
+  "campaignGoals": [],
+  "influencerTierIds": [],
+  "contentFormats": [],
+  "contentLanguageIds": [],
+  "preferredHashtags": [],
+  "paymentType": "",
+  "campaignBudget": 0,
+  "numberOfInfluencers": 1,
+  "minFollowers": 0,
+  "maxFollowers": 0,
+  "startAt": "",
+  "endAt": "",
+  "additionalNotes": ""
+}
 
 INPUT:
 ${JSON.stringify(ui, null, 2)}
@@ -1973,140 +2029,227 @@ exports.prefillCampaignWithAI = async (req, res) => {
     const brandIdR = requireObjectId(res, requestId, "brandId", req.body.brandId);
     if (!brandIdR.ok) return brandIdR.resp;
 
-    const titleR = requireString(res, requestId, "campaignTitle", req.body.campaignTitle);
-    if (!titleR.ok) return titleR.resp;
+    const sourceBrief =
+      clean(req.body.description) ||
+      clean(req.body.campaignPrompt) ||
+      clean(req.body.prompt) ||
+      clean(req.body.message);
 
-    const descR = requireString(res, requestId, "description", req.body.description);
-    if (!descR.ok) return descR.resp;
-
-    const catR = requireObjectId(res, requestId, "categoryId", req.body.categoryId);
-    if (!catR.ok) return catR.resp;
-
-    const subR = requireIdArray(res, requestId, "subcategoryIds", req.body.subcategoryIds);
-    if (!subR.ok) return subR.resp;
-
-    const countryR = requireIdArray(res, requestId, "targetCountryIds", req.body.targetCountryIds);
-    if (!countryR.ok) return countryR.resp;
-
-    const ageR = requireIdArray(res, requestId, "targetAgeRanges", req.body.targetAgeRanges);
-    if (!ageR.ok) return ageR.resp;
-
-    const imgs = toUnknownArray(req.body.productImages);
-
-    if (!imgs.length) {
+    if (!sourceBrief) {
       return failField(
         res,
         HttpStatus.BAD_REQUEST,
         "VALIDATION_ERROR",
-        "productImages",
-        requestId
+        "description",
+        requestId,
+        "Please describe your campaign."
       );
     }
 
-    const uploadedProductImages = imgs
-      .map((img) => {
-        if (typeof img === "string") return clean(img);
-
-        if (img && typeof img === "object") {
-          return clean(
-            img.url ||
-            img.imageUrl ||
-            img.s3Url ||
-            img.s3Link ||
-            img.location ||
-            img.Location ||
-            img.secure_url ||
-            img.src ||
-            img.path ||
-            ""
-          );
-        }
-
-        return "";
-      })
-      .filter(Boolean);
-
-
-
-
-
-
     const productLink = clean(req.body.productLink);
-
+    if (productLink && !isValidHttpUrl(productLink)) {
+      return failField(
+        res,
+        HttpStatus.BAD_REQUEST,
+        "VALIDATION_ERROR",
+        "productLink",
+        requestId,
+        "productLink must be a valid http/https URL"
+      );
+    }
 
     const videoLink = clean(req.body.videoLink);
     if (videoLink && !isValidHttpUrl(videoLink)) {
-      return failField(res, HttpStatus.BAD_REQUEST, "VALIDATION_ERROR", "videoLink", requestId, "videoLink must be a valid http/https URL");
+      return failField(
+        res,
+        HttpStatus.BAD_REQUEST,
+        "VALIDATION_ERROR",
+        "videoLink",
+        requestId,
+        "videoLink must be a valid http/https URL"
+      );
     }
 
-    const rel = await resolveCategoryAndSubcategories(catR.value, subR.value);
-    if (rel.error) {
-      return fail(res, HttpStatus.BAD_REQUEST, "VALIDATION_ERROR", rel.error, requestId);
-    }
+    const uploadedProductImages = req.body.productImages
+      ? await normalizeProductImagesForDraft(req.body.productImages)
+      : [];
 
-    const prefillDetails = {
-      category: rel.cat ? { id: String(rel.cat._id), name: String(rel.cat.name || "") } : null,
-      subcategories: (rel.subs || []).map((s) => ({
-        id: String(s._id),
-        name: String(s.name || ""),
-        tags: s.tags ?? [],
-      })),
-    };
+    const [
+      categories,
+      goals,
+      tiers,
+      formats,
+      langs,
+      countries,
+      ages,
+    ] = await Promise.all([
+      Category.find({})
+        .select("_id name subcategories")
+        .lean()
+        .limit(200),
 
-    const [goals, tiers, formats, langs] = await Promise.all([
-      ProductServiceGoalModel.find({ isActive: true }).select("_id goal").lean().limit(120),
-      InfluencerTier.find({}).select("_id category value sortOrder").lean().limit(120),
-      ContentFormat.find({}).select("_id name title type format").lean().limit(200),
-      ContentLanguage.find({ isActive: true }).select("_id code name").lean().limit(200),
+      ProductServiceGoalModel.find({ isActive: { $ne: false } })
+        .select("_id goal")
+        .lean()
+        .limit(120),
+
+      InfluencerTier.find({})
+        .select("_id category value sortOrder")
+        .lean()
+        .limit(120),
+
+      ContentFormat.find({})
+        .select("_id name title type format")
+        .lean()
+        .limit(200),
+
+      ContentLanguage.find({ isActive: { $ne: false } })
+        .select("_id code name")
+        .lean()
+        .limit(200),
+
+      Country.find({})
+        .select("_id countryNameEn countryNameLocal countryName name countryCode flag")
+        .lean()
+        .limit(250),
+
+      AgeRange.find({})
+        .select("_id range")
+        .lean()
+        .limit(100),
     ]);
 
-    const prefHashtagsDocs = await PreferredHashtag.find({
-      subcategoryId: { $in: subR.value.map((x) => toObjectId(x)) },
-    })
-      .select("_id hashtag tag name")
-      .lean()
-      .limit(300);
+    const allowedCategories = (categories || [])
+      .map((cat) => ({
+        id: String(cat._id),
+        label: String(cat.name || ""),
+        subcategories: (Array.isArray(cat.subcategories) ? cat.subcategories : [])
+          .map((sub) => ({
+            id: String(sub._id),
+            label: String(sub.name || ""),
+            tags: sub.tags ?? [],
+          }))
+          .filter((sub) => sub.id && sub.label),
+      }))
+      .filter((cat) => cat.id && cat.label && cat.subcategories.length);
 
     const allowed = {
-      campaignGoals: goals.map((g) => ({ id: String(g._id), label: String(g.goal ?? "") })),
-      influencerTiers: tiers.map((t) => ({
+      categories: allowedCategories,
+
+      campaignGoals: (goals || []).map((g) => ({
+        id: String(g._id),
+        label: String(g.goal ?? ""),
+      })),
+
+      influencerTiers: (tiers || []).map((t) => ({
         id: String(t._id),
         label: [t.category, t.value].filter(Boolean).join(" ").trim(),
       })),
-      contentFormats: formats.map((f) => ({
+
+      contentFormats: (formats || []).map((f) => ({
         id: String(f._id),
         label: String(f.name ?? f.title ?? f.type ?? f.format ?? ""),
       })),
-      contentLanguages: langs.map((l) => ({
+
+      contentLanguages: (langs || []).map((l) => ({
         id: String(l._id),
         label: `${l.name ?? ""} ${l.code ? `(${l.code})` : ""}`.trim(),
       })),
-      preferredHashtags: prefHashtagsDocs.map((h) => ({
-        id: String(h._id),
-        label: String(h.hashtag ?? h.tag ?? h.name ?? ""),
+
+      targetCountries: (countries || []).map((c) => ({
+        id: String(c._id),
+        label: String(c.countryNameEn || c.countryName || c.name || c.countryNameLocal || c.countryCode || ""),
+        countryCode: String(c.countryCode || ""),
+      })),
+
+      targetAgeRanges: (ages || []).map((a) => ({
+        id: String(a._id),
+        label: String(a.range || ""),
       })),
     };
 
+    const imageContext = uploadedProductImages.map((img, index) => ({
+      index,
+      name: String(img.name || ""),
+      url: String(img.dataUrl || img.url || img.imageUrl || img.s3Url || img.location || img.Location || img.secure_url || img.src || ""),
+      type: String(img.contentType || img.type || ""),
+      size: Number(img.size || img.originalSize || 0) || 0,
+      key: String(img.key || ""),
+    }));
+
     const ui = {
       source: {
-        campaignTitle: titleR.value,
-        description: descR.value,
-        campaignType: clean(req.body.campaignType) || "",
-        categoryId: catR.value,
-        subcategoryIds: subR.value,
+        description: sourceBrief,
+        campaignPrompt: clean(req.body.campaignPrompt) || sourceBrief,
         productLink: productLink || null,
         videoLink: videoLink || null,
-        targetCountryIds: countryR.value,
-        targetAgeRanges: ageR.value,
-        additionalNotes: clean(req.body.additionalNotes) || "",
+
+        productImages: imageContext,
+        productImageCount: imageContext.length,
+        hasProductImages: imageContext.length > 0,
+        hasProductLink: Boolean(productLink),
       },
+
+      manualFormSchema: {
+        campaignTitle: "string",
+        description: "string",
+        campaignType: "string",
+        categoryId: "ObjectId string",
+        subcategoryIds: "ObjectId string[]",
+        productImages: "preserved by backend from uploadedProductImages",
+        productLink: "preserved by backend from request productLink",
+        campaignGoals: "ObjectId string[]",
+        influencerTierIds: "ObjectId string[]",
+        contentFormats: "ObjectId string[]",
+        contentLanguageIds: "ObjectId string[]",
+        targetCountryIds: "ObjectId string[]",
+        targetAgeRanges: "ObjectId string[]",
+        preferredHashtags: "ObjectId string[]",
+        numberOfInfluencers: "number",
+        minFollowers: "number",
+        maxFollowers: "number",
+        campaignBudget: "number",
+        paymentType: "Milestone | Fixed | Gifting",
+        additionalNotes: "string",
+        startAt: "yyyy-MM-dd'T'HH:mm",
+        endAt: "yyyy-MM-dd'T'HH:mm",
+      },
+
+      manualValidationRules: {
+        required: [
+          "campaignTitle",
+          "enhancedDescription",
+          "categoryId",
+          "subcategoryIds",
+          "campaignGoals",
+          "influencerTierIds",
+          "contentFormats",
+          "targetCountryIds",
+          "targetAgeRanges",
+          "paymentType",
+          "campaignBudget",
+          "numberOfInfluencers",
+          "startAt",
+          "endAt",
+        ],
+        productImages: "AI does not generate this. Backend preserves uploaded images.",
+        productLink: "AI does not generate this. Backend preserves request productLink.",
+        minFollowers: `0 or >= ${MIN_FOLLOWERS_ALLOWED}`,
+        maxFollowers: `0 or >= ${MIN_FOLLOWERS_ALLOWED}; must be >= minFollowers when both are positive`,
+        campaignBudget: ">= 0",
+        numberOfInfluencers: ">= 1",
+        paymentType: ["Milestone", "Fixed", "Gifting"],
+      },
+
       allowedOptions: allowed,
+
       guidance: {
         timezone: tz,
         todayLocal: nowLocal.toFormat("yyyy-LL-dd"),
         datetimeFormat: "yyyy-MM-dd'T'HH:mm",
-        platformsAllowed: ["youtube", "instagram", "tiktok"],
+        fixedPlatform: "youtube",
         paymentTypesAllowed: ["Milestone", "Fixed", "Gifting"],
+        preserveAssets: true,
       },
     };
 
@@ -2117,83 +2260,151 @@ exports.prefillCampaignWithAI = async (req, res) => {
         .setZone(tz)
         .plus({ days: 1 })
         .set({ hour: 9, minute: 0, second: 0, millisecond: 0 });
+
       const end = start.plus({ days: 10 });
+
       const fmt = (d) =>
-        d.toISO({ suppressSeconds: true, suppressMilliseconds: true, includeOffset: false });
+        d.toISO({
+          suppressSeconds: true,
+          suppressMilliseconds: true,
+          includeOffset: false,
+        });
+
       return { startAt: fmt(start), endAt: fmt(end) };
     };
 
     const normalizeIsoLocal = (s) => {
       const v = clean(s);
       if (!v) return "";
+
       const dt = DateTime.fromISO(v, { zone: tz });
       if (!dt.isValid) return "";
-      return dt.toISO({ suppressSeconds: true, suppressMilliseconds: true, includeOffset: false });
+
+      return dt.toISO({
+        suppressSeconds: true,
+        suppressMilliseconds: true,
+        includeOffset: false,
+      });
     };
 
     const pickIds = (value, allowedIds, min = 0) => {
       const set = new Set(allowedIds);
       const picked = normalizeObjectIdArray(value).filter((id) => set.has(id));
-      if (picked.length >= min) return picked;
+
+      if (picked.length >= min) return [...new Set(picked)];
+
       return allowedIds.slice(0, Math.min(min, allowedIds.length));
     };
 
     const normalizePayment = (v) => {
-      const s = clean(v);
-      const x = normalizePaymentType(s || "Milestone");
-      if (["Milestone", "Fixed", "Gifting"].includes(x)) return x;
-      return "Milestone";
+      const x = normalizePaymentType(clean(v) || "Milestone");
+      return ["Milestone", "Fixed", "Gifting"].includes(x) ? x : "Milestone";
+    };
+
+    const fallbackTitleFromBrief = (text) => {
+      const cleanText = String(text || "")
+        .replace(/\s+/g, " ")
+        .trim();
+
+      const firstSentence = cleanText.split(/[.!?]/)[0]?.trim();
+      const title = firstSentence || cleanText;
+
+      if (!title) return "AI Generated Campaign";
+      return title.length > 72 ? `${title.slice(0, 69).trim()}...` : title;
     };
 
     const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
     let aiJson = {};
 
     if (!process.env.OPENAI_API_KEY) {
-      warnings.push("OPENAI_API_KEY missing: returned fallback prefill (no AI enrichment).");
+      warnings.push("OPENAI_API_KEY missing: returned fallback prefill.");
     } else {
       try {
         const prompt = buildAIPrompt(ui);
 
+        const imageInputs = imageContext
+          .map((img) => img.url)
+          .filter((url) => isValidHttpUrl(url))
+          .slice(0, 6)
+          .map((url) => ({
+            type: "input_image",
+            image_url: url,
+          }));
+
         const aiResp = await openai.responses.create({
           model,
           input: [
-            { role: "system", content: "Return JSON only. No markdown." },
-            { role: "user", content: prompt },
+            {
+              role: "system",
+              content:
+                "Return JSON only. No markdown. Align every generated value with the manual campaign form schema.",
+            },
+            {
+              role: "user",
+              content: [
+                {
+                  type: "input_text",
+                  text: prompt,
+                },
+                ...imageInputs,
+              ],
+            },
           ],
           text: { format: { type: "json_object" } },
-          temperature: 0.35,
-          max_output_tokens: 1200,
+          temperature: 0.25,
+          max_output_tokens: 2200,
         });
 
         try {
           aiJson = JSON.parse(aiResp.output_text || "{}");
         } catch {
-          warnings.push("AI returned invalid JSON: returned fallback values where needed.");
+          warnings.push("AI returned invalid JSON: fallback values were used.");
           aiJson = {};
         }
       } catch (e) {
-        warnings.push(`AI call failed: ${String(e?.message || "unknown error")}. Returned fallback values.`);
+        warnings.push(`AI call failed: ${String(e?.message || "unknown error")}. Fallback values were used.`);
         aiJson = {};
       }
     }
+
+    const pickedCategory =
+      allowed.categories.find((cat) => cat.id === clean(aiJson.categoryId)) ||
+      allowed.categories[0] ||
+      null;
+
+    const categoryIdPick = pickedCategory?.id || "";
+    const allowedSubIds = pickedCategory?.subcategories?.map((x) => x.id) || [];
+    const subcategoryIdsPick = pickIds(aiJson.subcategoryIds, allowedSubIds, allowedSubIds.length ? 1 : 0);
+
+    const prefHashtagsDocs = subcategoryIdsPick.length
+      ? await PreferredHashtag.find({
+        subcategoryId: { $in: subcategoryIdsPick.map((id) => toObjectId(id)) },
+      })
+        .select("_id hashtag tag name")
+        .lean()
+        .limit(300)
+      : [];
+
+    const allowedPreferredHashtags = prefHashtagsDocs.map((h) => ({
+      id: String(h._id),
+      label: String(h.hashtag ?? h.tag ?? h.name ?? ""),
+    }));
 
     const allowedGoalIds = allowed.campaignGoals.map((x) => x.id);
     const allowedTierIds = allowed.influencerTiers.map((x) => x.id);
     const allowedFormatIds = allowed.contentFormats.map((x) => x.id);
     const allowedLangIds = allowed.contentLanguages.map((x) => x.id);
-    const allowedHashIds = allowed.preferredHashtags.map((x) => x.id);
+    const allowedCountryIds = allowed.targetCountries.map((x) => x.id);
+    const allowedAgeIds = allowed.targetAgeRanges.map((x) => x.id);
+    const allowedHashIds = allowedPreferredHashtags.map((x) => x.id);
 
     const goalsPick = pickIds(aiJson.campaignGoals, allowedGoalIds, 1);
     const tiersPick = pickIds(aiJson.influencerTierIds, allowedTierIds, 1);
     const formatsPick = pickIds(aiJson.contentFormats, allowedFormatIds, 1);
-
     const langsPick = pickIds(aiJson.contentLanguageIds, allowedLangIds, 0);
+    const countriesPick = pickIds(aiJson.targetCountryIds, allowedCountryIds, 1);
+    const agesPick = pickIds(aiJson.targetAgeRanges, allowedAgeIds, 1);
     const hashtagsPick = pickIds(aiJson.preferredHashtags, allowedHashIds, 0);
-
-    const platformsPick = (() => {
-      const ps = toPlatformArray(aiJson.platformSelection);
-      return ps.length ? ps : ["instagram"];
-    })();
 
     const paymentPick = normalizePayment(aiJson.paymentType);
     const budgetPick = Math.max(0, Math.trunc(toNumber(aiJson.campaignBudget) || 0));
@@ -2209,6 +2420,7 @@ exports.prefillCampaignWithAI = async (req, res) => {
       warnings.push(`AI suggested minFollowers below ${MIN_FOLLOWERS_ALLOWED}; removed.`);
       minFollowersPick = undefined;
     }
+
     if (typeof maxFollowersPick === "number" && maxFollowersPick > 0 && maxFollowersPick < MIN_FOLLOWERS_ALLOWED) {
       warnings.push(`AI suggested maxFollowers below ${MIN_FOLLOWERS_ALLOWED}; removed.`);
       maxFollowersPick = undefined;
@@ -2216,6 +2428,7 @@ exports.prefillCampaignWithAI = async (req, res) => {
 
     let startAtPick = normalizeIsoLocal(aiJson.startAt);
     let endAtPick = normalizeIsoLocal(aiJson.endAt);
+
     if (!startAtPick || !endAtPick) {
       const d = defaultStartEnd();
       startAtPick = startAtPick || d.startAt;
@@ -2224,6 +2437,7 @@ exports.prefillCampaignWithAI = async (req, res) => {
 
     const st = DateTime.fromISO(startAtPick, { zone: tz });
     const en = DateTime.fromISO(endAtPick, { zone: tz });
+
     if (!st.isValid || !en.isValid || en <= st) {
       const d = defaultStartEnd();
       startAtPick = d.startAt;
@@ -2231,35 +2445,78 @@ exports.prefillCampaignWithAI = async (req, res) => {
       warnings.push("Invalid AI startAt/endAt: replaced with safe default window.");
     }
 
-    const enhancedDescription = clean(aiJson.enhancedDescription) || descR.value;
-    const enhancedTitle = clean(aiJson.enhancedTitle) || titleR.value;
+    const rel =
+      categoryIdPick && subcategoryIdsPick.length
+        ? await resolveCategoryAndSubcategories(categoryIdPick, subcategoryIdsPick)
+        : { cat: null, subs: [], error: "" };
+
+    if (rel.error) {
+      warnings.push(rel.error);
+    }
+
+    const enhancedTitle =
+      clean(aiJson.campaignTitle) ||
+      clean(aiJson.enhancedTitle) ||
+      fallbackTitleFromBrief(sourceBrief);
+
+    const enhancedDescription =
+      clean(aiJson.enhancedDescription) ||
+      sourceBrief;
+
+    const prefillDetails = {
+      category: rel.cat
+        ? { id: String(rel.cat._id), name: String(rel.cat.name || "") }
+        : pickedCategory
+          ? { id: pickedCategory.id, name: pickedCategory.label }
+          : null,
+
+      subcategories: rel.subs?.length
+        ? rel.subs.map((s) => ({
+          id: String(s._id),
+          name: String(s.name || ""),
+          tags: s.tags ?? [],
+        }))
+        : (pickedCategory?.subcategories || [])
+          .filter((sub) => subcategoryIdsPick.includes(sub.id))
+          .map((sub) => ({
+            id: sub.id,
+            name: sub.label,
+            tags: sub.tags ?? [],
+          })),
+    };
 
     const prefill = {
       brandId: brandIdR.value,
-      categoryId: catR.value,
-      subcategoryIds: subR.value,
-      targetCountryIds: countryR.value,
-      targetAgeRanges: ageR.value,
+
       campaignTitle: enhancedTitle,
       description: enhancedDescription,
-      campaignType: clean(req.body.campaignType) || "",
+      campaignType: clean(aiJson.campaignType) || "",
+
+      categoryId: categoryIdPick || undefined,
+      subcategoryIds: subcategoryIdsPick,
+
+      targetCountryIds: countriesPick,
+      targetAgeRanges: agesPick,
+
       productImages: uploadedProductImages,
       productLink: productLink || undefined,
       videoLink: videoLink || undefined,
+
       campaignGoals: goalsPick,
       influencerTierIds: tiersPick,
       contentFormats: formatsPick,
       contentLanguageIds: langsPick,
       preferredHashtags: hashtagsPick,
-      platformSelection: platformsPick,
       paymentType: paymentPick,
       campaignBudget: budgetPick,
       numberOfInfluencers: numInfluencersPick,
       minFollowers: minFollowersPick,
       maxFollowers: maxFollowersPick,
+
       startAt: startAtPick,
       endAt: endAtPick,
-      additionalNotes: clean(req.body.additionalNotes) || clean(aiJson.additionalNotes) || "",
+
+      additionalNotes: clean(aiJson.additionalNotes) || "",
     };
 
     if (req.body.saveDraft === true) {
@@ -2278,8 +2535,10 @@ exports.prefillCampaignWithAI = async (req, res) => {
           brandName: String(brandDoc.name || brandDoc.brandName || ""),
           createdBy: actor,
           approvalMode: actor.role === "admin" ? "admin_review" : "direct",
-          categoryName: rel?.cat?.name || "",
-          subcategoryNames: Array.isArray(rel?.subs) ? rel.subs.map((s) => String(s.name || "")) : [],
+          categoryName: prefillDetails.category?.name || "",
+          subcategoryNames: Array.isArray(prefillDetails.subcategories)
+            ? prefillDetails.subcategories.map((s) => String(s.name || ""))
+            : [],
           brandSubscriptionSnapshot,
         }
       );
@@ -2303,8 +2562,9 @@ exports.prefillCampaignWithAI = async (req, res) => {
             aiUsed: !!process.env.OPENAI_API_KEY,
             warnings,
             originalSource: {
-              campaignTitle: titleR.value,
-              description: descR.value,
+              description: sourceBrief,
+              productLink: productLink || null,
+              imageCount: uploadedProductImages.length,
             },
           },
         },
@@ -2322,19 +2582,19 @@ exports.prefillCampaignWithAI = async (req, res) => {
           aiUsed: !!process.env.OPENAI_API_KEY,
           warnings,
           originalSource: {
-            campaignTitle: titleR.value,
-            description: descR.value,
+            description: sourceBrief,
+            productLink: productLink || null,
+            imageCount: uploadedProductImages.length,
           },
         },
       },
       requestId
     );
   } catch (err) {
-    await saveErrorLog(req, err, err?.statusCode || err?.status || 500, "PREFILL_CAMPAIGN_WITH_AI_ERROR");
+    await saveErrorLog(req, err, err?.statusCode || err?.status || 500, "AI_PREFILL_CAMPAIGN_ERROR");
     return sendControllerError(res, requestId, err);
   }
 };
-
 
 const FULLY_MANAGED_CAMPAIGN_TEXT_MARKERS = [
   /^fully[\s_-]*managed$/i,
@@ -2466,10 +2726,6 @@ function serializeBrandCreatedCampaign(campaignDoc = {}) {
       ? campaignDoc.subcategoryIds.map((id) => String(id))
       : [],
 
-    platformSelection: Array.isArray(campaignDoc.platformSelection)
-      ? campaignDoc.platformSelection
-      : [],
-
     numberOfInfluencers: campaignDoc.numberOfInfluencers,
     applicantCount: campaignDoc.applicantCount,
     campaignBudget: campaignDoc.campaignBudget,
@@ -2563,9 +2819,9 @@ exports.getNonFullManagedCampaigns = async (req, res) => {
 
     const search = clean(
       req.query.search ||
-        req.query.q ||
-        req.body?.search ||
-        req.body?.q
+      req.query.q ||
+      req.body?.search ||
+      req.body?.q
     );
 
     const filter = {
@@ -2605,7 +2861,6 @@ exports.getNonFullManagedCampaigns = async (req, res) => {
           "campaignSubcategory",
           "categoryId",
           "subcategoryIds",
-          "platformSelection",
           "numberOfInfluencers",
           "applicantCount",
           "campaignBudget",
@@ -3114,11 +3369,11 @@ exports.getApprovedCampaignsByInfluencer = async (req, res) => {
 
     const influencerLookup = mongoose.Types.ObjectId.isValid(influencerIdString)
       ? {
-          $or: [
-            { _id: new mongoose.Types.ObjectId(influencerIdString) },
-            { influencerId: influencerIdString },
-          ],
-        }
+        $or: [
+          { _id: new mongoose.Types.ObjectId(influencerIdString) },
+          { influencerId: influencerIdString },
+        ],
+      }
       : { influencerId: influencerIdString };
 
     const influencer = await Influencer.findOne(
@@ -3242,11 +3497,11 @@ exports.getApprovedCampaignsByInfluencer = async (req, res) => {
     const filter =
       search && String(search).trim()
         ? {
-            $and: [
-              campaignIdFilter,
-              { $or: buildSearchOr(String(search).trim()) },
-            ],
-          }
+          $and: [
+            campaignIdFilter,
+            { $or: buildSearchOr(String(search).trim()) },
+          ],
+        }
         : campaignIdFilter;
 
     const [total, rawCampaigns] = await Promise.all([
@@ -3297,8 +3552,8 @@ exports.getApprovedCampaignsByInfluencer = async (req, res) => {
 
         hasMilestone:
           milestoneIds.has(campaignObjectId) ||
-          milestoneIds.has(campaignLegacyId) ||
-          details.status === CONTRACT_STATUS.MILESTONES_CREATED
+            milestoneIds.has(campaignLegacyId) ||
+            details.status === CONTRACT_STATUS.MILESTONES_CREATED
             ? 1
             : 0,
 
@@ -3354,11 +3609,11 @@ exports.getAppliedCampaignsByInfluencer = async (req, res) => {
 
     const influencerLookup = mongoose.Types.ObjectId.isValid(influencerIdString)
       ? {
-          $or: [
-            { _id: new mongoose.Types.ObjectId(influencerIdString) },
-            { influencerId: influencerIdString },
-          ],
-        }
+        $or: [
+          { _id: new mongoose.Types.ObjectId(influencerIdString) },
+          { influencerId: influencerIdString },
+        ],
+      }
       : { influencerId: influencerIdString };
 
     const inf = await Influencer.findOne(
@@ -3475,11 +3730,11 @@ exports.getAppliedCampaignsByInfluencer = async (req, res) => {
     const filter =
       search && String(search).trim()
         ? {
-            $and: [
-              campaignIdFilter,
-              { $or: buildSearchOr(String(search).trim()) },
-            ],
-          }
+          $and: [
+            campaignIdFilter,
+            { $or: buildSearchOr(String(search).trim()) },
+          ],
+        }
         : campaignIdFilter;
 
     const [total, rawCampaigns] = await Promise.all([
@@ -3514,11 +3769,11 @@ exports.getAppliedCampaignsByInfluencer = async (req, res) => {
     const getCountryName = (country = {}) =>
       String(
         country.countryNameEn ||
-          country.countryName ||
-          country.name ||
-          country.countryNameLocal ||
-          country.countryCode ||
-          ""
+        country.countryName ||
+        country.name ||
+        country.countryNameLocal ||
+        country.countryCode ||
+        ""
       ).trim();
 
     const getGoalName = (goal = {}) =>
@@ -6211,18 +6466,6 @@ exports.editDraftCampaign = async (req, res) => {
     setOrUnsetIdArray("targetAgeRanges", req.body.targetAgeRanges);
     setOrUnsetIdArray("preferredHashtags", req.body.preferredHashtags);
 
-    // platformSelection
-    if (req.body.platformSelection !== undefined) {
-      const ps = toPlatformArray(req.body.platformSelection);
-      if (!ps.length) {
-        update.$unset.platformSelection = 1;
-        validateView.platformSelection = [];
-      } else {
-        update.$set.platformSelection = ps;
-        validateView.platformSelection = ps;
-      }
-    }
-
     // paymentType
     if (req.body.paymentType !== undefined) {
       const p = cleanAny(req.body.paymentType);
@@ -7003,7 +7246,6 @@ exports.getPublicCampaignByToken = async (req, res) => {
           campaignBudget: campaign.campaignBudget,
           budget: campaign.budget,
           paymentType: campaign.paymentType,
-          platformSelection: campaign.platformSelection || [],
           targetCountryIds: campaign.targetCountryIds || [],
           targetAgeRanges: campaign.targetAgeRanges || [],
           productImages: campaign.productImages || [],
@@ -7642,9 +7884,7 @@ exports.getInfluencerMatchScore = async (req, res) => {
       ],
     });
 
-    const campaignPlatforms = uniq(
-      toArray(campaign.platformSelection).map(normalizePlatform).filter(Boolean)
-    );
+    const fixedCampaignPlatform = "youtube";
 
     const influencerPlatforms = uniq(
       [
@@ -7664,13 +7904,9 @@ exports.getInfluencerMatchScore = async (req, res) => {
     );
 
     const platformScore =
-      campaignPlatforms.length > 0
-        ? influencerPlatforms.length > 0
-          ? Math.round(
-            (campaignPlatforms.filter((item) => influencerPlatforms.includes(item)).length /
-              campaignPlatforms.length) *
-            100
-          )
+      influencerPlatforms.length > 0
+        ? influencerPlatforms.includes(fixedCampaignPlatform)
+          ? 100
           : 0
         : null;
 

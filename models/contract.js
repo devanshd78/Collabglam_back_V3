@@ -42,6 +42,13 @@ const ContractSchema = new Schema(
     brandPoc: { type: String, default: "", trim: true },
     brandPocDesignation: { type: String, default: "", trim: true },
 
+    contractSource: {
+      type: String,
+      enum: ["template", "uploaded"],
+      default: "template",
+      index: true,
+    },
+
     paymentType: {
       type: String,
       enum: PAYMENT_TYPE_VALUES,
@@ -76,7 +83,11 @@ const ContractSchema = new Schema(
     },
 
     requestedEffectiveDate: { type: Date, default: null },
-    requestedEffectiveDateTimezone: { type: String, default: "America/Los_Angeles", trim: true },
+    requestedEffectiveDateTimezone: {
+      type: String,
+      default: "America/Los_Angeles",
+      trim: true,
+    },
     effectiveDate: { type: Date, default: null },
     effectiveDateOverride: { type: Date, default: null },
     effectiveDateTimezone: { type: String, default: "", trim: true },
@@ -121,7 +132,12 @@ const ContractSchema = new Schema(
   { timestamps: true, minimize: false }
 );
 
-ContractSchema.index({ brandId: 1, influencerId: 1, campaignId: 1, createdAt: -1 });
+ContractSchema.index({
+  brandId: 1,
+  influencerId: 1,
+  campaignId: 1,
+  createdAt: -1,
+});
 ContractSchema.index({ brandId: 1, status: 1, updatedAt: -1 });
 ContractSchema.index({ influencerId: 1, status: 1, updatedAt: -1 });
 ContractSchema.index({ campaignId: 1, status: 1 });
@@ -136,6 +152,7 @@ ContractSchema.pre("validate", function contractPreValidate(next) {
   this.paymentType = normalizePaymentType(this.paymentType);
 
   const roles = Array.isArray(this.requiredSigners) ? this.requiredSigners : [];
+
   this.requiredSigners = [
     ...new Set(
       roles
@@ -144,7 +161,10 @@ ContractSchema.pre("validate", function contractPreValidate(next) {
     ),
   ];
 
-  if (!this.requiredSigners.length) this.requiredSigners = [...WORKFLOW_SIGNERS];
+  if (!this.requiredSigners.length) {
+    this.requiredSigners = [...WORKFLOW_SIGNERS];
+  }
+
   if (!this.currency) this.currency = "USD";
 
   next();
@@ -162,4 +182,5 @@ ContractSchema.statics.normalizeStatus = normalizeContractStatus;
 ContractSchema.statics.normalizePaymentType = normalizePaymentType;
 ContractSchema.statics.WORKFLOW_SIGNERS = WORKFLOW_SIGNERS;
 
-module.exports = mongoose.models.Contract || mongoose.model("Contract", ContractSchema);
+module.exports =
+  mongoose.models.Contract || mongoose.model("Contract", ContractSchema);
