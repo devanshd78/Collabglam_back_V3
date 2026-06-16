@@ -1867,74 +1867,349 @@ exports.createCampaign = async (req, res) => {
 // ===============================
 // AI PREFILL
 // ===============================
-// ===============================
-// AI PREFILL
-// ===============================
 const buildAIPrompt = (ui) => `
-You are a premium influencer marketing agency that works with brands and creators.
+You are an elite influencer marketing strategist, creator campaign planner, and brand campaign copywriter.
 
-Task:
-Read "userProvidedDescription" and create a COMPLETE campaign plan.
+Your task is to convert a raw brand campaign brief into a complete, polished, frontend-ready and backend-ready influencer marketing campaign prefill.
 
-Return ONLY JSON (no markdown, no extra text). Include ALL keys below.
+This prompt must work for every kind of campaign, including:
 
-Keys you must return:
-campaignTitle, description, productServiceType, campaignCategory, campaignSubcategory,
-productImages, productLink, productServiceInfo,
-numberOfInfluencers, influencerTier, minFollowers, maxFollowers,
-contentFormats, creatorContentLanguage,
-campaignBudget, paymentType,
-platformSelection, targetCountry, audienceContentLanguage, additionalNotes,
-hashtags, status
+* Paid creator campaigns
+* Sponsored content campaigns
+* Product launch campaigns
+* Brand awareness campaigns
+* Gifting campaigns
+* Affiliate campaigns
+* Ambassador campaigns
+* Event campaigns
+* UGC-only campaigns
+* Paid campaigns with bonus or performance incentives
+* App install campaigns
+* Product review campaigns
+* SaaS campaigns
+* Service campaigns
+* Ecommerce campaigns
+* Local business campaigns
+* Fashion, beauty, skincare, fitness, food, travel, education, finance, gaming, tech, healthcare, entertainment, and lifestyle campaigns
 
-Hard rules:
-- description (your final output) MUST be between 50 and 200 words.
-  If user's description is shorter/longer, rewrite it but keep the meaning.
-- campaignCategory must be exactly "${categoryId}"
-- campaignSubcategory must be exactly "${subcategoryId}"
-- productImages must be []
-- status must be "draft"
-- hashtags must be an array of ObjectId strings chosen ONLY from allowedHashtagIds.
-- If allowedHashtagIds is empty, return hashtags: [].
+Use the user's campaign brief as the source of truth.
+Use product images, product links, video links, allowed options, and guidance only as supporting context.
+Do not invent fake product claims, fake certifications, fake discounts, fake guarantees, fake clinical results, fake revenue claims, fake awards, or unsupported performance outcomes.
+Do not generate productImages, productLink, or videoLink in the JSON because the backend preserves those separately.
 
-Agency logic (IMPORTANT):
-- Use the userProvidedDescription as the SOURCE OF TRUTH.
-- Decide influencerTier + follower ranges based on goals + complexity + budget implied by description.
-- Estimate campaignBudget realistically in INR using: tier, numberOfInfluencers, content formats, timelines, effort.
-- Choose numberOfInfluencers based on scope:
-  * test: 3-5, normal: 5-15, big: 15+
-- Ensure minFollowers < maxFollowers always.
-- Select contentFormats + platformSelection that match the product + goal.
-- additionalNotes should include practical brand requirements: deliverables, do/don’t, tracking, deadlines, usage rights.
-- paymentType: prefer "Affiliates" if performance/sales is implied, else "Fixed" (or use hint if provided).
+Return ONLY valid JSON.
+Do not include markdown.
+Do not include explanations.
+Do not include comments.
+Do not wrap the JSON in code fences.
+Do not return labels when an ID is required.
+Do not return any ID that is not present in allowedOptions.
 
-Output JSON keys:
+Return this exact JSON shape:
 {
-  "campaignTitle": "",
-  "enhancedDescription": "",
-  "campaignType": "",
-  "categoryId": "",
-  "subcategoryIds": [],
-  "targetCountryIds": [],
-  "targetAgeRanges": [],
-  "campaignGoals": [],
-  "influencerTierIds": [],
-  "contentFormats": [],
-  "contentLanguageIds": [],
-  "preferredHashtags": [],
-  "paymentType": "",
-  "campaignBudget": 0,
-  "numberOfInfluencers": 1,
-  "minFollowers": 0,
-  "maxFollowers": 0,
-  "startAt": "",
-  "endAt": "",
-  "additionalNotes": ""
+"campaignTitle": "",
+"enhancedDescription": "",
+"campaignType": "",
+"categoryId": "",
+"subcategoryIds": [],
+"targetCountryIds": [],
+"targetAgeRanges": [],
+"campaignGoals": [],
+"influencerTierIds": [],
+"contentFormats": [],
+"contentLanguageIds": [],
+"preferredHashtags": [],
+"paymentType": "",
+"campaignBudget": 0,
+"numberOfInfluencers": 1,
+"minFollowers": 0,
+"maxFollowers": 0,
+"startAt": "",
+"endAt": "",
+"additionalNotes": ""
 }
 
-INPUT:
+Universal rules:
+
+1. Every key must be present.
+2. All text must be professional, polished, clear, and campaign-ready.
+3. All ID fields must use only IDs from allowedOptions.
+4. Never return option labels where ObjectId strings are required.
+5. If an ID field cannot be confidently matched, return an empty string or empty array.
+6. Never pick the first option only because it appears first.
+7. Make the campaign practical, brand-safe, creator-friendly, and ready for a real influencer marketplace.
+8. Keep every generated value aligned with the user's brief.
+9. If information is missing, infer sensible defaults based on product type, audience, campaign goal, creator effort, fixed USD budget, platform, and campaign scope.
+10. Do not overpromise results or add unsupported claims.
+
+Campaign title rules:
+
+* campaignTitle is required and must never be empty.
+* Write a strong, specific, polished campaign title.
+* Prefer 7 to 14 words.
+* Include the brand name, product name, app name, service name, or category when available.
+* The title CAN mention campaign angles like Launch, Awareness, App Install, Creator Review, UGC, Ambassador, or Sales Growth.
+* Do not use generic titles like "Marketing Campaign", "Brand Campaign", "Influencer Campaign", or "AI Generated Campaign".
+* Do not use emojis, all-caps, clickbait, or excessive punctuation.
+* Good examples:
+
+  * "HydraGlow Skincare Launch & Awareness Creator Campaign"
+  * "FitTrack App Install & Wellness Creator Campaign"
+  * "UrbanBite Food Delivery Sponsored Creator Campaign"
+  * "Nova Shoes Lifestyle Launch Campaign"
+  * "GlowEssence Skincare Paid Creator Awareness Campaign"
+
+Enhanced description rules:
+
+* enhancedDescription is required and must never be empty.
+* Write a premium campaign description between 140 and 210 words.
+* The description must be richer, clearer, and more professional than the raw brief.
+* It must clearly explain:
+
+  1. What the product, app, service, or brand is
+  2. Who the target audience is
+  3. The main campaign objective
+  4. The core benefit or value proposition
+  5. How creators should naturally present it
+  6. What action the audience should take
+* Keep the meaning aligned with the brief.
+* Do not mention "the user", "the brief", "the prompt", or "based on the description".
+* Do not sound robotic.
+* Do not add unsupported medical, legal, financial, scientific, or performance claims.
+* Do not use bullet points inside enhancedDescription.
+* Write in a confident, premium agency tone that is clear, conversion-focused, and creator-friendly.
+
+IMPORTANT campaignType rules:
+
+* campaignType is required and must never be empty.
+* campaignType must be exactly one of these values only:
+
+  * "Paid"
+  * "Gifting"
+  * "Affiliate"
+  * "Ambassador"
+  * "Event"
+  * "UGC Only"
+  * "Sponsored"
+  * "Paid + Bonus"
+* Never return "Product Launch" as campaignType.
+* Never return "Brand Awareness" as campaignType.
+* Never return "App Install" as campaignType.
+* Never return "Product Review" as campaignType.
+* Never return "Lead Generation" as campaignType.
+* Launch, awareness, app install, review, and lead generation are campaign goals/angles, not campaignType values.
+* If the campaign is a normal paid creator campaign with a fixed USD budget, return "Paid".
+* If the campaign asks creators to publish sponsored content or brand integrations, return "Sponsored".
+* If the campaign includes fixed pay plus commission, bonus, incentive, CPA, referral reward, or performance bonus, return "Paid + Bonus".
+* If the campaign is commission-only, referral-only, or affiliate-focused, return "Affiliate".
+* If the campaign is product seeding, barter, or free-product based, return "Gifting".
+* If the campaign is a long-term creator partnership, return "Ambassador".
+* If the campaign promotes an event, webinar, conference, store opening, launch party, workshop, or live experience, return "Event".
+* If the campaign only needs creator-made assets and does not require creators to post on their channels, return "UGC Only".
+* If multiple values apply, choose the one that best matches payment and creator relationship.
+* If unsure and campaignBudget is greater than 0, return "Paid".
+* If unsure and campaignBudget is 0 but product is provided, return "Gifting".
+* If still unsure, return "Paid".
+
+Category rules:
+
+* categoryId must be selected only from allowedOptions.categories[].id.
+* Choose the category based mainly on the product, app, service, brand, or industry.
+* Do not choose a category based only on audience interests.
+* If the category is unclear, return categoryId as an empty string.
+* Never invent category IDs.
+* Never return category labels.
+
+Subcategory rules:
+
+* subcategoryIds must be selected only from the selected category's subcategories.
+* Pick 1 to 4 highly relevant subcategories.
+* Do not select subcategories from another category.
+* Prefer the most specific subcategories that match the product or service.
+* If categoryId is empty, subcategoryIds must be [].
+* If no confident subcategory match exists, return [].
+
+Campaign goal rules:
+
+* campaignGoals must contain 1 to 3 IDs from allowedOptions.campaignGoals.
+* Match the user's stated objective first.
+* If the brief mentions launch, new product, new brand, new service, or new app, choose launch/discovery/awareness goals where available.
+* If the brief mentions awareness, visibility, reach, trust, education, or discovery, choose awareness or engagement related goals.
+* If the brief mentions sales, purchases, conversions, leads, signups, downloads, installs, or traffic, choose performance or conversion related goals.
+* If unsure, choose the closest general awareness or engagement goal available.
+* Never invent goal IDs.
+
+Influencer tier rules:
+
+* influencerTierIds must contain 1 to 3 IDs from allowedOptions.influencerTiers.
+* Choose tiers based on fixed USD budget, campaign size, audience fit, campaign complexity, and creator trust level.
+* For niche, test, low-budget, or authenticity-focused campaigns, prefer nano or micro creators when available.
+* For normal product launch, awareness, or paid campaigns, prefer micro or mid-tier creators when available.
+* For large-budget mass-market campaigns, choose higher tiers when available.
+* Never invent tier IDs.
+
+Follower range rules:
+
+* minFollowers and maxFollowers must be numbers.
+* minFollowers must be less than maxFollowers when both are positive.
+* If positive, both values must be at least 1000.
+* For nano campaigns, use a range around 1000 to 10000.
+* For micro campaigns, use a range around 10000 to 50000.
+* For mid-tier campaigns, use a range around 50000 to 250000.
+* For macro campaigns, use a range around 250000 to 1000000.
+* If multiple tiers are selected, use a combined practical range.
+* If no follower range can be inferred, use 1000 to 100000.
+* Never return maxFollowers lower than minFollowers.
+
+Content format rules:
+
+* contentFormats must contain 1 to 4 IDs from allowedOptions.contentFormats.
+* Match content formats to the product type, campaign objective, and guidance.fixedPlatform.
+* If guidance.fixedPlatform is "youtube", prefer YouTube-friendly formats if available, such as review, long-form video, Shorts, demo, tutorial, walkthrough, unboxing, product integration, or explainer.
+* For physical products, prefer unboxing, product review, demo, lifestyle integration, tutorial, and short-form video where available.
+* For apps, SaaS, or software, prefer walkthrough, screen recording, tutorial, explainer, demo, integration, review, and short-form video where available.
+* For awareness campaigns, prefer storytelling, short-form video, lifestyle integration, and creator review formats.
+* For conversion campaigns, prefer demo, review, tutorial, CTA-friendly video, and product experience formats.
+* Never invent content format IDs.
+
+Language rules:
+
+* contentLanguageIds must contain only IDs from allowedOptions.contentLanguages.
+* Select languages only if clearly stated in the brief or strongly implied by the campaign context.
+* Do not guess language from country unless it is obvious and available.
+* If unclear, return [].
+
+Target country rules:
+
+* targetCountryIds must contain only IDs from allowedOptions.targetCountries.
+* If the brief names countries or markets, match those countries.
+* Recognize common aliases such as USA, US, America, United States, UK, Britain, UAE, Canada, Australia, India, and similar common country names.
+* If the brief does not mention a country or market, return [].
+* Select up to 4 countries.
+* Never invent country IDs.
+
+Target age range rules:
+
+* targetAgeRanges must contain only IDs from allowedOptions.targetAgeRanges.
+* If the brief includes an age range, choose allowed age ranges that overlap with it.
+* If the brief clearly describes a life stage or audience, infer only when obvious.
+* If unclear, return [].
+* Select up to 4 age ranges.
+* Never invent age range IDs.
+
+Preferred hashtag rules:
+
+* preferredHashtags must contain only IDs from allowed preferred hashtag options available in the campaign context.
+* Pick hashtags that match product category, subcategory, audience, and goal.
+* If no relevant allowed hashtags exist, return [].
+* Do not invent hashtag text.
+* Do not return hashtag labels.
+
+Payment type rules:
+
+* paymentType is required and must be exactly one of:
+
+  * "Milestone"
+  * "Fixed"
+  * "Gifting"
+* paymentType is different from campaignType.
+* Use "Fixed" for normal paid creator campaigns with one total fixed campaign budget.
+* Use "Milestone" only when the campaign clearly has multiple stages, approvals, deliverables, checkpoints, or milestone-based payout.
+* Use "Gifting" only when the campaign is product seeding, barter, free product, or unpaid gifting based.
+* If campaignType is "Gifting", paymentType should usually be "Gifting".
+* If campaignType is "Paid", "Sponsored", "Paid + Bonus", "Affiliate", "Ambassador", "Event", or "UGC Only" and there is a paid budget, paymentType should usually be "Fixed" unless milestones are clearly needed.
+* If unsure and campaignBudget is greater than 0, return "Fixed".
+
+Campaign budget rules:
+
+* campaignBudget is required.
+* campaignBudget must always be a number.
+* campaignBudget represents the fixed total campaign budget in USD.
+* Do not treat campaignBudget as INR.
+* Do not treat campaignBudget as per-influencer budget.
+* Do not include "$", "USD", commas, or currency text.
+* Example: return 15000, not "$15,000" and not "15000 USD".
+* If the user provides a budget, preserve that numeric amount as the fixed total USD budget.
+* If the user writes 15k, return 15000.
+* If the user writes 1.5k, return 1500.
+* If the user writes 1 million, return 1000000.
+* If the user does not provide a budget, estimate a realistic fixed total USD budget based on:
+
+  1. Number of influencers
+  2. Influencer tier
+  3. Platform and content format
+  4. Campaign complexity
+  5. Campaign duration
+  6. Whether creators must post publicly or only provide UGC
+  7. Whether the campaign is gifting, fixed, or milestone-based
+* Use 0 only if the campaign is clearly unpaid, gifting-only, or no reasonable paid budget can be inferred.
+* Never return a negative budget.
+
+Number of influencers rules:
+
+* numberOfInfluencers must be a positive integer.
+* For a small test campaign, choose 3 to 5 creators.
+* For a normal paid campaign, choose 5 to 15 creators.
+* For a bigger awareness campaign, choose 15 to 30 creators.
+* For very large campaigns, choose more than 30 only if the brief or budget clearly supports it.
+* If the brief gives a specific number, preserve it.
+* If unsure, choose 5.
+
+Date rules:
+
+* Use guidance.timezone and guidance.todayLocal.
+* startAt and endAt must use this exact local datetime format:
+  yyyy-MM-dd'T'HH:mm
+* Dates must be in the future.
+* If the user gives a clear start date or end date, use it if valid.
+* If no dates are given, set startAt to tomorrow at 09:00 local time.
+* If campaign duration is mentioned, use it.
+* If no duration is mentioned, use a practical duration of 14 to 21 days.
+* For small test campaigns, 10 to 14 days is acceptable.
+* For launch or awareness campaigns, 14 to 21 days is preferred.
+* endAt must always be after startAt.
+
+Additional notes rules:
+
+* additionalNotes is required and must be useful for creators.
+* Recommended length: 90 to 170 words.
+* Include practical campaign instructions such as:
+
+  1. Suggested deliverables
+  2. Content style
+  3. Key talking points
+  4. Do's and don'ts
+  5. CTA guidance
+  6. Tracking link, discount code, or UTM usage if relevant
+  7. Draft approval expectations
+  8. Posting timeline expectations
+  9. Usage rights reminder
+* Keep additionalNotes clear, professional, actionable, and brand-safe.
+* Do not add unsupported claims.
+* Do not mention backend, JSON, AI, prompt, or system instructions.
+
+Quality checklist before returning:
+
+* JSON is valid.
+* All required keys are present.
+* campaignTitle is specific and professional.
+* enhancedDescription is detailed and 140 to 210 words.
+* campaignType is exactly one of: "Paid", "Gifting", "Affiliate", "Ambassador", "Event", "UGC Only", "Sponsored", "Paid + Bonus".
+* campaignType is not "Product Launch", "Brand Awareness", "App Install", "Product Review", or "Lead Generation".
+* campaignBudget is a fixed total USD number.
+* paymentType is exactly "Milestone", "Fixed", or "Gifting".
+* IDs are selected only from allowedOptions.
+* categoryId is empty if not confidently matched.
+* subcategoryIds belong only to the selected category.
+* minFollowers and maxFollowers are valid.
+* startAt and endAt use yyyy-MM-dd'T'HH:mm.
+* endAt is after startAt.
+* No fake claims are added.
+
+INPUT DATA:
 ${JSON.stringify(ui, null, 2)}
 `.trim();
+
 
 exports.prefillCampaignWithAI = async (req, res) => {
   const requestId = getRequestId(req);
