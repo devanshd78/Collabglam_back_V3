@@ -2575,6 +2575,7 @@ exports.getCampaignsByInfluencer = async (req, res) => {
         pages: 0,
         influencer: {
           _id: internalInfluencerId,
+          influencerId: internalInfluencerId,
           name: influencerName,
           email: influencer.email || "",
         },
@@ -2601,6 +2602,7 @@ exports.getCampaignsByInfluencer = async (req, res) => {
         pages: 0,
         influencer: {
           _id: internalInfluencerId,
+          influencerId: internalInfluencerId,
           name: influencerName,
           email: influencer.email || "",
         },
@@ -2670,23 +2672,57 @@ exports.getCampaignsByInfluencer = async (req, res) => {
       ),
     ].filter((goalId) => mongoose.Types.ObjectId.isValid(goalId));
 
-    const [countries, ageRanges, campaignGoals] = await Promise.all([
+    const getBrandMongoId = (campaign = {}) => {
+      const rawBrandId =
+        campaign?.createdBy?.userModel === "Brand"
+          ? campaign?.createdBy?.userId
+          : campaign?.createdBy?.userId ||
+          campaign?.brandId ||
+          campaign?.brand?._id ||
+          campaign?.createdByBrand ||
+          campaign?.userId ||
+          "";
+
+      const brandMongoId = String(rawBrandId || "").trim();
+
+      return mongoose.Types.ObjectId.isValid(brandMongoId)
+        ? brandMongoId
+        : "";
+    };
+
+    const brandMongoIds = [
+      ...new Set(campaigns.map(getBrandMongoId).filter(Boolean)),
+    ];
+
+    const [countries, ageRanges, campaignGoals, brands] = await Promise.all([
       allCountryIds.length
         ? Country.find(
           { _id: { $in: allCountryIds } },
           "_id countryNameEn countryNameLocal countryName name countryCode"
         ).lean()
         : Promise.resolve([]),
+
       allAgeRangeIds.length
-        ? AgeRange.find(
-          { _id: { $in: allAgeRangeIds } },
-          "_id range"
-        ).lean()
+        ? AgeRange.find({ _id: { $in: allAgeRangeIds } }, "_id range").lean()
         : Promise.resolve([]),
+
       allCampaignGoalIds.length
         ? ProductServiceGoalModel.find(
           { _id: { $in: allCampaignGoalIds } },
           "_id goal"
+        ).lean()
+        : Promise.resolve([]),
+
+      brandMongoIds.length
+        ? Brand.find(
+          {
+            _id: {
+              $in: brandMongoIds.map(
+                (brandId) => new mongoose.Types.ObjectId(brandId)
+              ),
+            },
+          },
+          "_id brandName name email proxyEmail website profilePic industry companySize companyDetails pocContact currencyFormat preferredLanguage region"
         ).lean()
         : Promise.resolve([]),
     ]);
@@ -2713,6 +2749,10 @@ exports.getCampaignsByInfluencer = async (req, res) => {
       campaignGoals.map((item) => [String(item._id), item.goal || ""])
     );
 
+    const brandMap = new Map(
+      brands.map((brand) => [String(brand._id), brand])
+    );
+
     const result = campaigns.map((campaign) => {
       const campaignId = String(campaign._id);
 
@@ -2720,19 +2760,19 @@ exports.getCampaignsByInfluencer = async (req, res) => {
         (doc) => String(doc.campaignId || "") === campaignId
       );
 
+      const approvedApplicant = related?.approved?.find(
+        (item) => String(item.influencerId || "") === internalInfluencerId
+      );
+
+      const applicant = related?.applicants?.find(
+        (item) => String(item.influencerId || "") === internalInfluencerId
+      );
+
       let applicationStatus = "pending";
 
-      if (
-        related?.approved?.some(
-          (item) => String(item.influencerId || "") === internalInfluencerId
-        )
-      ) {
+      if (approvedApplicant) {
         applicationStatus = "approved";
-      } else if (
-        related?.applicants?.some(
-          (item) => String(item.influencerId || "") === internalInfluencerId
-        )
-      ) {
+      } else if (applicant) {
         applicationStatus = "applied";
       }
 
@@ -2756,6 +2796,7 @@ exports.getCampaignsByInfluencer = async (req, res) => {
         targetCountryValues.length > 0
           ? targetCountryValues.join(", ")
           : campaign.targetCountry || "";
+
       const targetAgeGroupValues = targetAgeRanges.map(
         (ageRangeId) => ageRangeMap.get(ageRangeId) || ageRangeId
       );
@@ -2764,17 +2805,65 @@ exports.getCampaignsByInfluencer = async (req, res) => {
         (goalId) => campaignGoalMap.get(goalId) || goalId
       );
 
+      const brandMongoId = getBrandMongoId(campaign);
+      const brandDoc = brandMongoId ? brandMap.get(brandMongoId) : null;
+
+      const resolvedBrandId = brandDoc?._id
+        ? String(brandDoc._id)
+        : brandMongoId;
+
+      const resolvedBrandName =
+        brandDoc?.brandName ||
+        brandDoc?.name ||
+        campaign.brandName ||
+        "";
+
+      const resolvedBrandProfilePic =
+        brandDoc?.profilePic ||
+        campaign.brandProfilePic ||
+        campaign.brandprofilepic ||
+        campaign.brandLogoUrl ||
+        campaign.brandLogo ||
+        "";
+
       return {
         id: campaignId,
         campaignId,
+
+        brandId: resolvedBrandId,
+        brand: {
+          _id: resolvedBrandId,
+          brandId: resolvedBrandId,
+          brandName: resolvedBrandName,
+          name: brandDoc?.name || "",
+          email: brandDoc?.email || "",
+          proxyEmail: brandDoc?.proxyEmail || "",
+          website: brandDoc?.website || "",
+          profilePic: resolvedBrandProfilePic,
+          industry: brandDoc?.industry || "",
+          companySize: brandDoc?.companySize || "",
+          companyDetails: brandDoc?.companyDetails || "",
+          pocContact: brandDoc?.pocContact || "",
+          currencyFormat: brandDoc?.currencyFormat || "",
+          preferredLanguage: brandDoc?.preferredLanguage || "",
+          region: brandDoc?.region || "",
+        },
+
         campaignName: campaign.campaignTitle || "",
         name: campaign.campaignTitle || "",
         campaignTitle: campaign.campaignTitle || "",
-        brandName: campaign.brandName || "",
+
+        brandName: resolvedBrandName,
+        brandProfilePic: resolvedBrandProfilePic,
+        brandLogoUrl: resolvedBrandProfilePic,
+
         influencer: {
           _id: internalInfluencerId,
+          influencerId: internalInfluencerId,
           name: influencerName,
+          email: influencer.email || "",
         },
+
         description: campaign.description || "",
         campaignType: campaign.campaignType || "",
         campaignCategory: campaign.campaignCategory || "",
@@ -2782,55 +2871,80 @@ exports.getCampaignsByInfluencer = async (req, res) => {
         categoryId: campaign.categoryId || null,
         subcategoryIds: campaign.subcategoryIds || [],
         categories: campaign.categories || [],
+
         productImages: campaign.productImages || [],
         images: campaign.productImages || [],
+
         productLink: campaign.productLink || "",
         videoLink: campaign.videoLink || "",
         productServiceInfo: campaign.productServiceInfo || [],
+
         campaignGoals: campaign.campaignGoals || [],
         campaignGoalValues,
+
         influencerTierIds: campaign.influencerTierIds || [],
         contentFormats: campaign.contentFormats || [],
         contentLanguageIds: campaign.contentLanguageIds || [],
         preferredHashtags: campaign.preferredHashtags || [],
+
         targetCountryIds: campaign.targetCountryIds || [],
         targetCountryValues,
         targetCountries: targetCountryValues,
         targetCountry,
+
         targetAgeRanges: campaign.targetAgeRanges || [],
         targetAgeGroupValues,
+
         numberOfInfluencers: campaign.numberOfInfluencers || 0,
         influencerTier: campaign.influencerTier || "",
         minFollowers: campaign.minFollowers || 0,
         maxFollowers: campaign.maxFollowers || 0,
+
         creatorContentLanguage: campaign.creatorContentLanguage || "",
         audienceContentLanguage: campaign.audienceContentLanguage || "",
-        targetCountry: campaign.targetCountry || "",
+
         campaignBudget: campaign.campaignBudget || 0,
         budget: campaign.budget || campaign.campaignBudget || 0,
         influencerBudget: campaign.influencerBudget || 0,
         paymentType: campaign.paymentType || "Milestone",
+
         platformSelection: campaign.platformSelection || [],
         hashtags: campaign.hashtags || [],
         additionalNotes: campaign.additionalNotes || "",
         campaignTimezone: campaign.campaignTimezone || "UTC",
+
         startAt: campaign.startAt || null,
         endAt: campaign.endAt || null,
         publishedAt: campaign.publishedAt || null,
         timeline: campaign.timeline || {},
+
         createdLocation: campaign.createdLocation || null,
+
         status: campaign.status || "draft",
         applicationStatus,
         publishStatus: campaign.publishStatus || "draft",
         approvalMode: campaign.approvalMode || "direct",
+
         isActive: campaign.isActive,
         isDraft: campaign.isDraft,
         byAi: campaign.byAi,
+
         applicantCount: campaign.applicantCount || 0,
-        hasApplied: campaign.hasApplied || 0,
+        hasApplied: applicant || approvedApplicant ? 1 : 0,
+        hasApproved: approvedApplicant ? 1 : 0,
+
         pendingUpdate: campaign.pendingUpdate || { status: "none" },
+
         createdBy: campaign.createdBy || null,
-        appliedDate: related?.createdAt || campaign.createdAt,
+
+        appliedDate:
+          applicant?.appliedAt ||
+          applicant?.createdAt ||
+          approvedApplicant?.approvedAt ||
+          approvedApplicant?.createdAt ||
+          related?.createdAt ||
+          campaign.createdAt,
+
         createdAt: campaign.createdAt,
         updatedAt: campaign.updatedAt,
       };
@@ -2842,13 +2956,20 @@ exports.getCampaignsByInfluencer = async (req, res) => {
       pages: Math.ceil(total / limitNum),
       influencer: {
         _id: internalInfluencerId,
+        influencerId: internalInfluencerId,
         name: influencerName,
         email: influencer.email || "",
       },
       campaigns: result,
     });
   } catch (error) {
-    await saveErrorLog(req, error, error?.statusCode || error?.status || 500, "GET_CAMPAIGNS_BY_INFLUENCER_ERROR");
+    await saveErrorLog(
+      req,
+      error,
+      error?.statusCode || error?.status || 500,
+      "GET_CAMPAIGNS_BY_INFLUENCER_ERROR"
+    );
+
     console.error("Error in getCampaignsByInfluencer:", error);
 
     return res.status(500).json({

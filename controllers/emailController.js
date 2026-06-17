@@ -1028,54 +1028,57 @@ async function getOrCreateThread({
 }) {
   const normalizedCampaignId = normalizeCampaignObjectId(campaign);
 
-  let thread = await EmailThread.findOne({
-    brand: brand._id,
-    influencer: influencer._id,
-    campaign: normalizedCampaignId,
-  });
-
-  if (thread) {
-    await syncThreadWithLiveParticipants(
-      thread,
-      brand,
-      influencer,
-      campaign || null,
-      subject
-    );
-    await thread.save();
-    return thread;
-  }
-
   const brandProxy = await ensureBrandProxyEmail(brand);
   const influencerProxy = await ensureInfluencerProxyEmail(influencer);
 
-  thread = await EmailThread.create({
+  const filter = {
     brand: brand._id,
     influencer: influencer._id,
     campaign: normalizedCampaignId,
+  };
 
-    brandSnapshot: {
-      name: getBrandLabel(brand),
-      email: brand.email,
+  const update = {
+    $set: {
+      brand: brand._id,
+      influencer: influencer._id,
+      campaign: normalizedCampaignId,
+
+      brandSnapshot: {
+        name: getBrandLabel(brand),
+        email: brand.email,
+      },
+
+      influencerSnapshot: {
+        name: getInfluencerLabel(influencer),
+        email: influencer.email,
+      },
+
+      campaignSnapshot: buildCampaignSnapshot(campaign),
+
+      brandAliasEmail: brandProxy,
+      influencerAliasEmail: influencerProxy,
+
+      brandDisplayAlias: brandProxy,
+      influencerDisplayAlias: influencerProxy,
     },
 
-    influencerSnapshot: {
-      name: getInfluencerLabel(influencer),
-      email: influencer.email,
+    $setOnInsert: {
+      subject: subject || undefined,
+      status: "active",
+      createdBy: createdBy || "system",
     },
+  };
 
-    campaignSnapshot: buildCampaignSnapshot(campaign),
-
-    brandAliasEmail: brandProxy,
-    influencerAliasEmail: influencerProxy,
-
-    brandDisplayAlias: brandProxy,
-    influencerDisplayAlias: influencerProxy,
-
-    subject: subject || undefined,
-    status: "active",
-    createdBy: createdBy || "system",
+  const thread = await EmailThread.findOneAndUpdate(filter, update, {
+    new: true,
+    upsert: true,
+    setDefaultsOnInsert: true,
   });
+
+  if (subject && !thread.subject) {
+    thread.subject = subject;
+    await thread.save();
+  }
 
   return thread;
 }

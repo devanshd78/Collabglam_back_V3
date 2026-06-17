@@ -6955,27 +6955,461 @@ function buildCampaignLookupForInfluencerView(campaignId) {
   return { _id: toObjectId(raw) };
 }
 
+const toStringId = (value) => {
+  if (!value) return "";
+
+  if (typeof value === "string" || typeof value === "number") {
+    return String(value).trim();
+  }
+
+  if (typeof value === "object") {
+    if (typeof value.toHexString === "function") return value.toHexString();
+    if (typeof value.$oid === "string") return value.$oid;
+    if (typeof value.oid === "string") return value.oid;
+    if (value._id) return toStringId(value._id);
+    if (value.id) return toStringId(value.id);
+
+    const text = String(value);
+    return text && text !== "[object Object]" ? text : "";
+  }
+
+  return "";
+};
+
+const isObjectIdLike = (value) => /^[a-f0-9]{24}$/i.test(toStringId(value));
+
+const pickString = (...values) => {
+  for (const value of values) {
+    if (value === null || value === undefined) continue;
+
+    const text = String(value).trim();
+    if (text) return text;
+  }
+
+  return "";
+};
+
+const asArray = (value) => {
+  if (!value) return [];
+  return Array.isArray(value) ? value : [value];
+};
+
+
+const cleanTagValue = (value) => {
+  const text = pickString(value);
+
+  if (!text) return "";
+  if (isObjectIdLike(text)) return "";
+
+  return text;
+};
+
+const uniqueClean = (values) => {
+  const seen = new Set();
+
+  return values
+    .map(cleanTagValue)
+    .filter(Boolean)
+    .filter((value) => {
+      const key = value.toLowerCase();
+
+      if (seen.has(key)) return false;
+
+      seen.add(key);
+      return true;
+    });
+};
+
+const toTagValues = (input) => {
+  const values = asArray(input).flatMap((item) => {
+    if (item === null || item === undefined) return [];
+
+    if (typeof item === "string" || typeof item === "number") {
+      return String(item)
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean);
+    }
+
+    if (typeof item === "object") {
+      const value = pickString(
+        item.label,
+        item.name,
+        item.title,
+        item.value,
+        item.tag,
+        item.range,
+        item.categoryName,
+        item.subcategoryName,
+        item.subCategoryName,
+        item.goal,
+        item.goalName,
+        item.type,
+        item.campaignType,
+        item.countryNameEn,
+        item.countryName,
+        item.countryCode,
+        item.language,
+        item.format,
+        item.tier
+      );
+
+      return value ? [value] : [];
+    }
+
+    return [];
+  });
+
+  return uniqueClean(values);
+};
+
+const normalizeFile = (file, fallbackName = "Attachment") => {
+  if (!file) return null;
+
+  if (typeof file === "string") {
+    return {
+      name: fallbackName,
+      url: file,
+      size: null,
+      type: "",
+    };
+  }
+
+  return {
+    name: pickString(file.name, file.filename, file.originalName, fallbackName),
+    url: pickString(file.url, file.src, file.path, file.location, file.fileUrl),
+    size: file.size ?? file.sizeBytes ?? null,
+    type: pickString(file.type, file.mimeType, file.mimetype),
+  };
+};
+
+const normalizeImage = (image) => {
+  if (!image) return null;
+
+  if (typeof image === "string") {
+    return {
+      url: image,
+      name: "",
+      size: null,
+      type: "",
+    };
+  }
+
+  const url = pickString(
+    image.url,
+    image.src,
+    image.path,
+    image.imageUrl,
+    image.dataUrl,
+    image.location,
+    image.fileUrl
+  );
+
+  if (!url) return null;
+
+  return {
+    url,
+    name: pickString(image.name, image.filename, image.originalName),
+    size: image.size ?? image.sizeBytes ?? null,
+    type: pickString(image.type, image.mimeType, image.mimetype),
+  };
+};
+
+const getCampaignRefConditions = (campaignObjectId, campaignLegacyId) => {
+  return [
+    { campaignId: campaignObjectId },
+    ...(campaignLegacyId ? [{ campaignId: campaignLegacyId }] : []),
+  ];
+};
+
+const sameInfluencer = (value, internalInfluencerId, publicInfluencerId) => {
+  const id = toStringId(value);
+
+  return id === internalInfluencerId || id === publicInfluencerId;
+};
+
+const findBrandForCampaign = async (campaign) => {
+  const possibleBrandIds = [
+    campaign?.brandId,
+    campaign?.brand?._id,
+    campaign?.brand,
+    campaign?.createdByBrand,
+    campaign?.createdBy,
+    campaign?.userId,
+  ]
+    .map(toStringId)
+    .filter(Boolean);
+
+  const brandOr = [];
+
+  possibleBrandIds.forEach((brandId) => {
+    if (isObjectIdLike(brandId)) {
+      brandOr.push({ _id: brandId });
+    }
+
+    brandOr.push({ brandId });
+  });
+
+  const brandEmail = pickString(
+    campaign?.brandEmail,
+    campaign?.brand?.email,
+    campaign?.email
+  );
+
+  if (brandEmail) {
+    brandOr.push({ email: brandEmail.toLowerCase() });
+  }
+
+  if (!brandOr.length) return null;
+
+  return Brand.findOne({ $or: brandOr })
+    .select(
+      "_id brandName name email proxyEmail website profilePic industry companySize companyDetails pocContact currencyFormat preferredLanguage region createdAt updatedAt"
+    )
+    .lean();
+};
+
 exports.viewCampaignByIdForInfluencer = async (req, res) => {
   const requestId = getRequestId(req);
 
   try {
+    const normalizeLabel = (value) => {
+      const text = String(value || "")
+        .trim()
+        .replace(/[_-]+/g, " ")
+        .replace(/\s+/g, " ");
+
+      if (!text) return "";
+      if (/^[a-f0-9]{24}$/i.test(text)) return "";
+
+      return text
+        .split(" ")
+        .map((word) => {
+          if (!word) return "";
+          if (word.length <= 2) return word.toUpperCase();
+          return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
+        })
+        .join(" ")
+        .trim();
+    };
+
+    const uniqueLabels = (values = []) => {
+      const seen = new Set();
+
+      return values
+        .flatMap((value) => {
+          if (value === null || value === undefined) return [];
+          if (Array.isArray(value)) return value;
+
+          if (typeof value === "string") {
+            return value
+              .split(",")
+              .map((item) => item.trim())
+              .filter(Boolean);
+          }
+
+          return [value];
+        })
+        .map((item) => {
+          if (item === null || item === undefined) return "";
+
+          if (typeof item === "string" || typeof item === "number") {
+            return normalizeLabel(item);
+          }
+
+          if (typeof item === "object") {
+            return normalizeLabel(
+              pickString(
+                item.label,
+                item.goal,
+                item.goalName,
+                item.campaignGoal,
+                item.campaignGoalName,
+                item.campaignType,
+                item.type,
+                item.name,
+                item.title,
+                item.value,
+                item.format,
+                item.language,
+                item.tier,
+                item.range,
+                item.countryNameEn,
+                item.countryName,
+                item.countryCode,
+                item.categoryName,
+                item.subcategoryName
+              )
+            );
+          }
+
+          return "";
+        })
+        .filter(Boolean)
+        .filter((label) => {
+          const key = label.toLowerCase();
+
+          if (seen.has(key)) return false;
+
+          seen.add(key);
+          return true;
+        });
+    };
+
+    const removeLabels = (values = [], labelsToRemove = []) => {
+      const removeSet = new Set(
+        labelsToRemove.map((item) => String(item || "").trim().toLowerCase())
+      );
+
+      return values.filter(
+        (item) => !removeSet.has(String(item || "").trim().toLowerCase())
+      );
+    };
+
+    const getCategoryLabels = (campaignDoc = {}, details = {}) => {
+      return uniqueLabels([
+        details?.category?.name,
+        campaignDoc.campaignCategory,
+        campaignDoc.category,
+        ...(Array.isArray(campaignDoc.categories)
+          ? campaignDoc.categories.map((item) => item?.categoryName)
+          : []),
+      ]);
+    };
+
+    const getSubcategoryLabels = (campaignDoc = {}, details = {}) => {
+      return uniqueLabels([
+        ...(Array.isArray(details.subcategories)
+          ? details.subcategories.map(
+              (item) =>
+                item?.subcategoryName ||
+                item?.name ||
+                item?.label ||
+                item?.title
+            )
+          : []),
+        campaignDoc.campaignSubcategory,
+        campaignDoc.subcategory,
+        campaignDoc.subCategory,
+        ...(Array.isArray(campaignDoc.categories)
+          ? campaignDoc.categories.map((item) => item?.subcategoryName)
+          : []),
+      ]);
+    };
+
+    const getGoalLabel = (goal) => {
+      if (!goal) return "";
+
+      if (typeof goal === "string" || typeof goal === "number") {
+        return normalizeLabel(goal);
+      }
+
+      return normalizeLabel(
+        pickString(
+          goal.label,
+          goal.goal,
+          goal.goalName,
+          goal.campaignGoal,
+          goal.campaignGoalName,
+          goal.name,
+          goal.title,
+          goal.value
+        )
+      );
+    };
+
+    const getCampaignGoalDetails = (
+      campaignDoc = {},
+      details = {},
+      resolvedGoalDocs = []
+    ) => {
+      const detailGoals = Array.isArray(details.campaignGoals)
+        ? details.campaignGoals
+        : [];
+
+      const fromDetails = detailGoals
+        .map((goal) => ({
+          id: toStringId(goal?.id || goal?._id),
+          label: getGoalLabel(goal),
+          goal: getGoalLabel(goal),
+        }))
+        .filter((goal) => goal.id || goal.label);
+
+      if (fromDetails.length) return fromDetails;
+
+      const fromResolvedDocs = resolvedGoalDocs
+        .map((goal) => ({
+          id: toStringId(goal?._id || goal?.id),
+          label: getGoalLabel(goal),
+          goal: getGoalLabel(goal),
+        }))
+        .filter((goal) => goal.id || goal.label);
+
+      if (fromResolvedDocs.length) return fromResolvedDocs;
+
+      const fallbackGoals = asArray(
+        campaignDoc.campaignGoalDetails ||
+          campaignDoc.campaignGoalValues ||
+          campaignDoc.campaignGoal ||
+          []
+      );
+
+      return fallbackGoals
+        .map((goal) => ({
+          id: toStringId(goal?.id || goal?._id),
+          label: getGoalLabel(goal),
+          goal: getGoalLabel(goal),
+        }))
+        .filter((goal) => goal.id || goal.label);
+    };
+
+    const getCampaignTypeLabels = (campaignDoc = {}, details = {}) => {
+      return uniqueLabels([
+        campaignDoc.campaignType,
+        campaignDoc.campaignTypes,
+        details.campaignType,
+        details.campaignTypes,
+      ]);
+    };
+
+    const toRows = (values = [], keyName = "label") => {
+      return values.map((label, index) => ({
+        id: String(index + 1),
+        [keyName]: label,
+        label,
+      }));
+    };
+
+    const getFirstPositiveNumber = (...values) => {
+      for (const value of values) {
+        const num = toNumber(value);
+
+        if (num > 0) return num;
+      }
+
+      return 0;
+    };
+
     const influencerIdRaw = clean(req.body.influencerId);
+
     if (!influencerIdRaw) {
-      return fail(res, 400, "VALIDATION_ERROR", "influencerId is required", requestId);
+      return fail(
+        res,
+        400,
+        "VALIDATION_ERROR",
+        "influencerId is required",
+        requestId
+      );
     }
 
-    // support both Mongo _id and custom influencerId
     const influencerLookup = mongoose.Types.ObjectId.isValid(influencerIdRaw)
       ? {
-        $or: [
-          { _id: influencerIdRaw },
-          { influencerId: influencerIdRaw }
-        ]
-      }
+          $or: [{ _id: influencerIdRaw }, { influencerId: influencerIdRaw }],
+        }
       : { influencerId: influencerIdRaw };
 
     const influencerDoc = await Influencer.findOne(influencerLookup)
-      .select("_id influencerId name")
+      .select("_id influencerId name email profilePic profileImage")
       .lean();
 
     if (!influencerDoc) {
@@ -6983,80 +7417,497 @@ exports.viewCampaignByIdForInfluencer = async (req, res) => {
     }
 
     const internalInfluencerId = String(influencerDoc._id);
-    const publicInfluencerId = String(influencerDoc.influencerId || influencerDoc._id);
+    const publicInfluencerId = String(
+      influencerDoc.influencerId || influencerDoc._id
+    );
 
     const campaignId = clean(req.body.campaignId);
+
     if (!campaignId) {
-      return fail(res, 400, "VALIDATION_ERROR", "campaignId is required", requestId);
+      return fail(
+        res,
+        400,
+        "VALIDATION_ERROR",
+        "campaignId is required",
+        requestId
+      );
     }
 
     if (!isOid(campaignId)) {
-      return fail(res, 400, "VALIDATION_ERROR", "Valid campaignId is required", requestId);
+      return fail(
+        res,
+        400,
+        "VALIDATION_ERROR",
+        "Valid campaignId is required",
+        requestId
+      );
     }
 
     const filter = buildCampaignLookupForInfluencerView(campaignId);
+
     if (!filter) {
-      return fail(res, 400, "VALIDATION_ERROR", "Valid campaignId is required", requestId);
+      return fail(
+        res,
+        400,
+        "VALIDATION_ERROR",
+        "Valid campaignId is required",
+        requestId
+      );
     }
 
-    const campaign = await Campaign.findOne(filter).lean();
-    if (!campaign) {
+    const campaignDoc = await Campaign.findOne(filter).lean();
+
+    if (!campaignDoc) {
       return fail(res, 404, "NOT_FOUND", "Campaign not found", requestId);
     }
 
-    const campaignObjectId = String(campaign._id);
-    const campaignLegacyId = campaign.campaignId
-      ? String(campaign.campaignId).trim()
+    const campaignObjectId = String(campaignDoc._id);
+
+    const campaignLegacyId = campaignDoc.campaignId
+      ? String(campaignDoc.campaignId).trim()
       : "";
 
-    const hasApplied = await ApplyCampaign.exists({
-      $and: [
-        {
-          $or: [
-            { campaignId: campaignObjectId },
-            ...(campaignLegacyId ? [{ campaignId: campaignLegacyId }] : [])
-          ]
-        },
-        {
-          $or: [
-            { "applicants.influencerId": internalInfluencerId },
-            { "applicants.influencerId": publicInfluencerId }
-          ]
-        }
-      ]
-    });
+    const campaignRefConditions = getCampaignRefConditions(
+      campaignObjectId,
+      campaignLegacyId
+    );
+
+    const applyDoc = await ApplyCampaign.findOne(
+      {
+        $or: campaignRefConditions,
+      },
+      "applicants approved createdAt updatedAt"
+    ).lean();
+
+    const applicants = asArray(applyDoc?.applicants);
+    const approvedApplicants = asArray(applyDoc?.approved);
+
+    const currentApplicant = applicants.find((applicant) =>
+      sameInfluencer(
+        applicant?.influencerId || applicant?.influencer?._id,
+        internalInfluencerId,
+        publicInfluencerId
+      )
+    );
+
+    const currentApprovedApplicant = approvedApplicants.find((applicant) =>
+      sameInfluencer(
+        applicant?.influencerId || applicant?.influencer?._id,
+        internalInfluencerId,
+        publicInfluencerId
+      )
+    );
+
+    const hasApplied = Boolean(currentApplicant || currentApprovedApplicant);
 
     const contract = await Contract.findOne(
       {
         $and: [
           {
-            $or: [
-              { campaignId: campaignObjectId },
-              ...(campaignLegacyId ? [{ campaignId: campaignLegacyId }] : [])
-            ]
+            $or: campaignRefConditions,
           },
           {
-            influencerId: { $in: [internalInfluencerId, publicInfluencerId] }
-          }
-        ]
+            influencerId: { $in: [internalInfluencerId, publicInfluencerId] },
+          },
+        ],
       },
-      "contractId isAccepted isAssigned status"
+      "contractId isAccepted isAssigned status createdAt updatedAt"
     ).lean();
 
-    const enriched = (await enrichCampaigns([campaign]))[0];
+    const enrichedCampaign =
+      (await enrichCampaigns([campaignDoc]))[0] || campaignDoc;
 
-    const doc = {
-      ...enriched,
-      hasApplied: hasApplied ? 1 : 0,
-      hasApproved: contract?.isAssigned === 1 ? 1 : 0,
-      isContracted: contract ? 1 : 0,
-      isAccepted: contract?.isAccepted === 1 ? 1 : 0,
-      contractId: contract?.contractId || null
+    const details = enrichedCampaign.details || {};
+
+    const goalObjectIds = asArray(enrichedCampaign.campaignGoals)
+      .map(toStringId)
+      .filter((id) => mongoose.Types.ObjectId.isValid(id));
+
+    let resolvedGoalDocs = [];
+
+    if (
+      goalObjectIds.length &&
+      typeof ProductServiceGoalModel !== "undefined"
+    ) {
+      resolvedGoalDocs = await ProductServiceGoalModel.find(
+        {
+          _id: {
+            $in: goalObjectIds.map((id) => new mongoose.Types.ObjectId(id)),
+          },
+        },
+        "_id goal name label title"
+      ).lean();
+    }
+
+    const brandDoc = await findBrandForCampaign(enrichedCampaign);
+
+    const brandId = brandDoc?._id
+      ? String(brandDoc._id)
+      : toStringId(enrichedCampaign.brandId);
+
+    const brand = {
+      _id: brandId,
+      brandId,
+
+      brandName: pickString(
+        brandDoc?.brandName,
+        brandDoc?.name,
+        enrichedCampaign.brandName,
+        enrichedCampaign.brand?.brandName,
+        enrichedCampaign.brand?.name,
+        "Brand"
+      ),
+
+      name: pickString(brandDoc?.name, enrichedCampaign.brand?.name),
+
+      email: pickString(
+        brandDoc?.email,
+        enrichedCampaign.brandEmail,
+        enrichedCampaign.brand?.email
+      ),
+
+      proxyEmail: pickString(brandDoc?.proxyEmail),
+
+      website: pickString(
+        brandDoc?.website,
+        details.website,
+        enrichedCampaign.website,
+        enrichedCampaign.brand?.website
+      ),
+
+      profilePic: pickString(
+        brandDoc?.profilePic,
+        enrichedCampaign.brandProfilePic,
+        enrichedCampaign.brandprofilepic,
+        enrichedCampaign.brandLogoUrl,
+        enrichedCampaign.brandLogo,
+        enrichedCampaign.brand?.profilePic,
+        enrichedCampaign.brand?.logo,
+        enrichedCampaign.brand?.logoUrl
+      ),
+
+      industry: pickString(brandDoc?.industry),
+      companySize: pickString(brandDoc?.companySize),
+      companyDetails: pickString(brandDoc?.companyDetails),
+      pocContact: pickString(brandDoc?.pocContact),
+      currencyFormat: pickString(brandDoc?.currencyFormat),
+      preferredLanguage: pickString(brandDoc?.preferredLanguage),
+      region: pickString(brandDoc?.region),
     };
 
-    return ApiResponse.sendOk(res, 200, { doc }, requestId);
+    const categoryLabels = getCategoryLabels(enrichedCampaign, details);
+    const subcategoryLabels = getSubcategoryLabels(enrichedCampaign, details);
+
+    const rawCampaignGoalDetails = getCampaignGoalDetails(
+      enrichedCampaign,
+      details,
+      resolvedGoalDocs
+    );
+
+    const cleanedCampaignGoalDetails = rawCampaignGoalDetails
+      .map((goal) => ({
+        id: goal.id,
+        label: normalizeLabel(goal.label || goal.goal),
+        goal: normalizeLabel(goal.goal || goal.label),
+      }))
+      .filter((goal) => goal.label)
+      .filter((goal) => {
+        const lower = goal.label.toLowerCase();
+
+        return ![...categoryLabels, ...subcategoryLabels].some(
+          (label) => label.toLowerCase() === lower
+        );
+      })
+      .filter((goal, index, list) => {
+        return (
+          list.findIndex(
+            (item) => item.label.toLowerCase() === goal.label.toLowerCase()
+          ) === index
+        );
+      });
+
+    const campaignGoalLabels = cleanedCampaignGoalDetails.map(
+      (goal) => goal.label
+    );
+
+    const campaignTypeLabels = removeLabels(
+      getCampaignTypeLabels(enrichedCampaign, details),
+      [...categoryLabels, ...subcategoryLabels, ...campaignGoalLabels]
+    );
+
+    const currency = pickString(
+      enrichedCampaign.currency,
+      details.currency,
+      enrichedCampaign.budgetCurrency,
+      "USD"
+    );
+
+    const minPayout = getFirstPositiveNumber(
+      enrichedCampaign.influencerBudget,
+      details.influencerBudget,
+      enrichedCampaign.budgetMin
+    );
+
+    const maxPayout = getFirstPositiveNumber(
+      enrichedCampaign.campaignBudget,
+      details.campaignBudget,
+      enrichedCampaign.totalBudget,
+      enrichedCampaign.budget,
+      enrichedCampaign.budgetMax
+    );
+
+    const pdfRaw =
+      enrichedCampaign.brandGuideline ||
+      enrichedCampaign.brandGuidelines ||
+      enrichedCampaign.creativeBrief ||
+      enrichedCampaign.creativeBriefs ||
+      enrichedCampaign.pdf ||
+      enrichedCampaign.pdfAttachment ||
+      enrichedCampaign.attachment ||
+      enrichedCampaign.attachments ||
+      details.brandGuideline ||
+      details.brandGuidelines ||
+      details.creativeBrief ||
+      details.creativeBriefs ||
+      details.pdf ||
+      details.pdfAttachment ||
+      details.attachment ||
+      details.attachments ||
+      null;
+
+    const pdfItem = Array.isArray(pdfRaw) ? pdfRaw[0] : pdfRaw;
+
+    const allAppliedInfluencerIds = [
+      ...applicants.map((item) => toStringId(item?.influencerId)),
+      ...approvedApplicants.map((item) => toStringId(item?.influencerId)),
+    ].filter(Boolean);
+
+    const appliedInfluencerCount = new Set(allAppliedInfluencerIds).size;
+
+    const campaign = {
+      _id: String(enrichedCampaign._id),
+
+      campaignId: pickString(
+        enrichedCampaign.campaignId,
+        enrichedCampaign._id
+      ),
+
+      title: pickString(
+        enrichedCampaign.campaignTitle,
+        enrichedCampaign.campaignName,
+        enrichedCampaign.title,
+        enrichedCampaign.name,
+        enrichedCampaign.productOrServiceName,
+        "Campaign"
+      ),
+
+      status: pickString(enrichedCampaign.status, "draft"),
+
+      campaignStatus: pickString(
+        enrichedCampaign.campaignStatus,
+        enrichedCampaign.status,
+        "draft"
+      ),
+
+      productUrl: pickString(
+        details.productUrl,
+        details.productLink,
+        enrichedCampaign.productUrl,
+        enrichedCampaign.productLink
+      ),
+
+      description: pickString(
+        enrichedCampaign.description,
+        enrichedCampaign.campaignDescription,
+        details.description,
+        details.campaignDescription
+      ),
+
+      additionalNotes: pickString(
+        enrichedCampaign.additionalNotes,
+        enrichedCampaign.notes,
+        enrichedCampaign.additionalInformation,
+        details.additionalNotes,
+        details.notes,
+        details.additionalInformation
+      ),
+
+      campaignGoalIds: goalObjectIds,
+
+      campaignGoalDetails: cleanedCampaignGoalDetails,
+
+      campaignGoalRows: toRows(campaignGoalLabels, "goal"),
+
+      campaignGoals: campaignGoalLabels,
+
+      campaignType: campaignTypeLabels[0] || "",
+
+      campaignTypeRows: toRows(campaignTypeLabels, "type"),
+
+      campaignTypes: campaignTypeLabels,
+
+      category: categoryLabels,
+
+      subcategory: subcategoryLabels,
+
+      payout: {
+        currency,
+        min: minPayout,
+        max: maxPayout,
+      },
+
+      startAt:
+        enrichedCampaign.startAt ||
+        details.startAt ||
+        enrichedCampaign.startDate ||
+        enrichedCampaign.timeline?.startDate ||
+        null,
+
+      endAt:
+        enrichedCampaign.endAt ||
+        details.endAt ||
+        enrichedCampaign.endDate ||
+        enrichedCampaign.timeline?.endDate ||
+        null,
+
+      paymentType: pickString(
+        enrichedCampaign.paymentType,
+        details.paymentType
+      ),
+
+      numberOfInfluencers:
+        toNumber(
+          enrichedCampaign.numberOfInfluencers || details.numberOfInfluencers
+        ) || 0,
+
+      influencerTier: uniqueLabels([
+        details.influencerTiers,
+        enrichedCampaign.influencerTier,
+        enrichedCampaign.creatorTier,
+        details.influencerTier,
+      ]),
+
+      contentLanguage: uniqueLabels([
+        details.contentLanguages,
+        enrichedCampaign.contentLanguage,
+        enrichedCampaign.contentLanguages,
+        details.contentLanguage,
+      ]),
+
+      contentFormat: uniqueLabels([
+        details.contentFormats,
+        enrichedCampaign.contentFormat,
+        enrichedCampaign.contentFormats,
+        details.contentFormat,
+      ]),
+
+      minFollowers:
+        toNumber(enrichedCampaign.minFollowers || details.minFollowers) || 0,
+
+      maxFollowers:
+        toNumber(enrichedCampaign.maxFollowers || details.maxFollowers) || 0,
+
+      hashtags: uniqueLabels([
+        details.preferredHashtags,
+        enrichedCampaign.preferredHashtags,
+        enrichedCampaign.hashtags,
+        details.hashtags,
+      ]),
+
+      targetPlatforms: uniqueLabels([
+        enrichedCampaign.platformSelection,
+        enrichedCampaign.platforms,
+        details.platforms,
+        details.targetPlatforms,
+      ]),
+
+      targetCountries: uniqueLabels([
+        details.targetCountries,
+        enrichedCampaign.targetCountries,
+        enrichedCampaign.targetCountry,
+        enrichedCampaign.targetCountryValues,
+      ]),
+
+      targetAgeGroups: uniqueLabels([
+        details.targetAgeRanges,
+        enrichedCampaign.targetAgeRanges,
+        enrichedCampaign.targetAgeGroupValues,
+        enrichedCampaign.targetAgeRangeValues,
+        enrichedCampaign.ageRanges,
+      ]),
+
+      videoReferenceUrl: pickString(
+        enrichedCampaign.videoReference,
+        enrichedCampaign.videoReferenceUrl,
+        enrichedCampaign.referenceVideoUrl,
+        enrichedCampaign.videoUrl,
+        enrichedCampaign.videoLink,
+        details.videoReference,
+        details.videoReferenceUrl,
+        details.referenceVideoUrl,
+        details.videoUrl,
+        details.videoLink
+      ),
+
+      productImages: asArray(enrichedCampaign.productImages)
+        .map(normalizeImage)
+        .filter(Boolean),
+
+      brandGuideline: normalizeFile(pdfItem, "Brandguideline.pdf"),
+
+      appliedInfluencerCount,
+
+      createdAt: enrichedCampaign.createdAt || null,
+      updatedAt: enrichedCampaign.updatedAt || null,
+    };
+
+    const influencer = {
+      _id: String(influencerDoc._id),
+      influencerId: publicInfluencerId,
+      name: pickString(influencerDoc.name),
+      email: pickString(influencerDoc.email),
+
+      profilePic: pickString(
+        influencerDoc.profilePic,
+        influencerDoc.profileImage
+      ),
+
+      hasApplied: hasApplied ? 1 : 0,
+      hasApproved:
+        contract?.isAssigned === 1 || currentApprovedApplicant ? 1 : 0,
+      isContracted: contract ? 1 : 0,
+      isAccepted: contract?.isAccepted === 1 ? 1 : 0,
+
+      contractId: contract?.contractId || null,
+      contractStatus: contract?.status || null,
+
+      appliedAt:
+        currentApplicant?.appliedAt ||
+        currentApplicant?.createdAt ||
+        currentApprovedApplicant?.approvedAt ||
+        currentApprovedApplicant?.createdAt ||
+        applyDoc?.createdAt ||
+        null,
+    };
+
+    return ApiResponse.sendOk(
+      res,
+      200,
+      {
+        brand,
+        influencer,
+        campaign,
+      },
+      requestId
+    );
   } catch (err) {
-    await saveErrorLog(req, err, err?.statusCode || err?.status || 500, "VIEW_CAMPAIGN_BY_ID_FOR_INFLUENCER_ERROR");
+    await saveErrorLog(
+      req,
+      err,
+      err?.statusCode || err?.status || 500,
+      "VIEW_CAMPAIGN_BY_ID_FOR_INFLUENCER_ERROR"
+    );
+
     return sendControllerError(res, requestId, err);
   }
 };
