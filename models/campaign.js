@@ -177,12 +177,6 @@ const CampaignSchema = new Schema(
       set: normalizePaymentType,
     },
 
-    platformSelection: {
-      type: [String],
-      default: [],
-      enum: ["youtube", "instagram", "tiktok"],
-    },
-
     additionalNotes: { type: String, trim: true, default: "" },
     hashtags: { type: [String], default: [] },
 
