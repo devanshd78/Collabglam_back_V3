@@ -27,6 +27,84 @@ const Campaign =
     '../models/campaign',
   ]) || null;
 
+const CampaignInfluencer =
+  tryRequireModel([
+    '../models/campaignInfluencer.model',
+    '../models/campaignInfluencerModel',
+    '../models/CampaignInfluencer',
+    '../models/campaignInfluencer',
+  ]) || null;
+
+const CountryModel =
+  tryRequireModel([
+    '../models/country.model',
+    '../models/countryModel',
+    '../models/Country',
+    '../models/country',
+  ]) || null;
+
+const CategoryModel =
+  tryRequireModel([
+    '../models/category.model',
+    '../models/categoryModel',
+    '../models/Category',
+    '../models/category',
+  ]) || null;
+
+const SubcategoryModel =
+  tryRequireModel([
+    '../models/subcategory.model',
+    '../models/subCategory.model',
+    '../models/subcategoryModel',
+    '../models/Subcategory',
+    '../models/SubCategory',
+    '../models/subcategory',
+  ]) || null;
+
+const InfluencerTierModel =
+  tryRequireModel([
+    '../models/influencerTier.model',
+    '../models/influencerTierModel',
+    '../models/InfluencerTier',
+    '../models/influencerTier',
+    '../models/tier.model',
+  ]) || null;
+
+const CampaignGoalModel =
+  tryRequireModel([
+    '../models/campaignGoal.model',
+    '../models/campaignGoalModel',
+    '../models/CampaignGoal',
+    '../models/campaignGoal',
+  ]) || null;
+
+const ContentFormatModel =
+  tryRequireModel([
+    '../models/contentFormat.model',
+    '../models/contentFormatModel',
+    '../models/ContentFormat',
+    '../models/contentFormat',
+  ]) || null;
+
+
+function getMongoose() {
+  try {
+    return require('mongoose');
+  } catch (_) {
+    return null;
+  }
+}
+
+function toObjectIdOrNull(value) {
+  const id = cleanStr(value);
+  if (!id) return null;
+
+  const mongoose = getMongoose();
+  if (!mongoose?.Types?.ObjectId?.isValid(id)) return null;
+
+  return new mongoose.Types.ObjectId(id);
+}
+
 /* -------------------------------------------------------------------------- */
 /*                            YouTube key rotation                            */
 /* -------------------------------------------------------------------------- */
@@ -83,6 +161,13 @@ const CREATOR_LOOKBACK_DAYS = Number(
 // Pass strictFilters=true in the API query only when you want tier/country to be hard filters.
 const STRICT_FILTERS_DEFAULT =
   String(process.env.YOUTUBE_STRICT_FILTERS_DEFAULT || 'false').toLowerCase() === 'true';
+
+// Prevent multiple long YouTube recommendation refresh jobs for the same campaign/filter.
+// Use a Map instead of a Set so stale jobs can be recovered after a failed/aborted request.
+const CAMPAIGN_RECOMMENDATION_JOBS = new Map();
+const CAMPAIGN_RECOMMENDATION_JOB_TTL_MS = Number(
+  process.env.CAMPAIGN_RECOMMENDATION_JOB_TTL_MS || 10 * 60 * 1000
+);
 
 /* -------------------------------------------------------------------------- */
 /*                     Optional OpenAI creator intelligence                   */
@@ -873,7 +958,7 @@ function buildInfluencerDiscoveryData(doc, context = {}) {
       consistencyScore: doc.scores?.consistencyScore || 0,
       brandSafetyScore: doc.scores?.brandSafetyScore || 0,
       relevancyScore: doc.scores?.relevancyScore || score,
-      authenticityScore: doc.scores?.authenticityScore || 0,
+      authenticityScore: doc.scores?.authenticityScore || discovery.scores?.authenticityScore || mediaKit.performanceScores?.authenticityScore || 85,
       audienceCountryConfidence: doc.scores?.audienceCountryConfidence || 0,
       shortlistScore: score,
       nicheFit,
@@ -915,6 +1000,348 @@ function normalizeCampaignDetails(campaign = {}) {
   };
 }
 
+
+function getDocLabel(doc = {}) {
+  return cleanStr(
+    doc.name ||
+      doc.label ||
+      doc.title ||
+      doc.countryName ||
+      doc.country ||
+      doc.iso2 ||
+      doc.isoCode ||
+      doc.code ||
+      doc.slug
+  );
+}
+
+async function lookupLabelsByIds(Model, ids = []) {
+  if (!Model) return [];
+
+  const cleanIds = Array.from(new Set((ids || []).map(cleanStr).filter(Boolean)));
+  if (!cleanIds.length) return [];
+
+  try {
+    const rows = await Model.find({ _id: { $in: cleanIds } }).lean();
+    return rows.map(getDocLabel).filter(Boolean);
+  } catch (_) {
+    return [];
+  }
+}
+
+function normalizeLooseArray(value) {
+  if (Array.isArray(value)) return value.map(cleanStr).filter(Boolean);
+  if (typeof value === 'string') {
+    return value
+      .split(',')
+      .map(cleanStr)
+      .filter(Boolean);
+  }
+  return [];
+}
+
+function isGenericCampaignPhrase(value = '') {
+  const v = cleanStr(value).toLowerCase();
+  if (!v) return true;
+
+  const exactGeneric = new Set([
+    'campaign',
+    'new campaign',
+    'marketing campaign',
+    'creator marketing campaign',
+    'premium creator marketing campaign',
+    'premium campaign',
+    'product campaign',
+  ]);
+
+  if (exactGeneric.has(v)) return true;
+  if (/^premium\s+creator\s+marketing\s+campaign$/i.test(v)) return true;
+  if (/^the\s+product(\s+is|\s+built|$)/i.test(v)) return true;
+
+  return false;
+}
+
+function isLowValueCampaignTerm(value = '') {
+  const v = cleanStr(value).toLowerCase();
+  if (!v) return true;
+  if (isGenericCampaignPhrase(v)) return true;
+
+  const lowValue = new Set([
+    'audience', 'built', 'can', 'clearly', 'connect', 'creator-friendly',
+    'explain', 'feel', 'lifestyle-led', 'makes', 'message', 'naturally',
+    'prioritize', 'show', 'storytelling', 'authentic', 'valuable', 'value',
+    'desirable', 'memorable', 'everyday', 'appeal', 'strong', 'clear',
+  ]);
+
+  return lowValue.has(v);
+}
+
+function countrySearchName(country = '') {
+  const code = cleanStr(country).toUpperCase();
+  const map = {
+    US: 'United States',
+    IN: 'India',
+    GB: 'United Kingdom',
+    AU: 'Australia',
+    CA: 'Canada',
+    AE: 'UAE',
+    DE: 'Germany',
+    FR: 'France',
+  };
+  return map[code] || cleanStr(country);
+}
+
+function extractImportantCampaignTerms(text = '', limit = 12) {
+  const stop = new Set([
+    'the', 'and', 'with', 'for', 'this', 'that', 'from', 'through', 'around',
+    'strong', 'clear', 'value', 'campaign', 'creator', 'creators', 'content',
+    'product', 'brand', 'brands', 'marketing', 'premium', 'authentic', 'natural',
+    'story', 'stories', 'storytelling', 'highlight', 'highlights', 'appeal',
+    'designed', 'easy', 'understand', 'everyday', 'credible', 'experience',
+    'experiences', 'useful', 'desirable', 'memorable', 'showcases', 'lifestyle',
+    'audience', 'built', 'can', 'clearly', 'connect', 'explain', 'feel',
+    'makes', 'message', 'naturally', 'prioritize', 'youtube', 'who', 'will',
+    'should', 'their', 'your', 'they', 'using', 'around', 'through', 'into',
+  ]);
+
+  const counts = new Map();
+  cleanStr(text)
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, ' ')
+    .split(/\s+/)
+    .map((x) => x.trim())
+    .filter((x) => x.length >= 3 && !stop.has(x) && !/^\d+$/.test(x))
+    .forEach((word) => counts.set(word, (counts.get(word) || 0) + 1));
+
+  return Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([word]) => word)
+    .slice(0, limit);
+}
+
+function detectSubscriberTierFromLabels(labels = []) {
+  const value = labels.join(' ').toLowerCase();
+  if (/mega|1m|1 million|1000000/.test(value)) return 'mega';
+  if (/macro|500k|500,000/.test(value)) return 'macro';
+  if (/mid|mid-tier|100k|500k/.test(value)) return 'mid-tier';
+  if (/micro|10k|100k/.test(value)) return 'micro';
+  if (/nano|1k|10k/.test(value)) return 'nano';
+  return '';
+}
+
+function detectSubscriberTierFromBudget(budget) {
+  const amount = Number(budget || 0);
+  if (!amount) return '';
+  if (amount <= 150) return 'nano';
+  if (amount <= 500) return 'micro';
+  if (amount <= 1500) return 'mid-tier';
+  if (amount <= 5000) return 'macro';
+  return 'mega';
+}
+
+function normalizeCountryLabel(value = '') {
+  const raw = cleanStr(value);
+  if (!raw) return '';
+
+  const map = {
+    usa: 'US',
+    'u.s.': 'US',
+    'u.s.a.': 'US',
+    'united states': 'US',
+    'united states of america': 'US',
+    india: 'IN',
+    bharat: 'IN',
+    uk: 'GB',
+    'united kingdom': 'GB',
+    england: 'GB',
+    canada: 'CA',
+    australia: 'AU',
+    germany: 'DE',
+    france: 'FR',
+    uae: 'AE',
+    'united arab emirates': 'AE',
+  };
+
+  const lower = raw.toLowerCase();
+  if (map[lower]) return map[lower];
+  if (/^[A-Za-z]{2}$/.test(raw)) return raw.toUpperCase();
+  return raw;
+}
+
+async function enrichCampaignReferenceLabels(campaign = {}) {
+  const [countryLabels, categoryLabels, subcategoryLabels, tierLabels, goalLabels, formatLabels] =
+    await Promise.all([
+      lookupLabelsByIds(CountryModel, campaign.targetCountryIds || campaign.countryIds || []),
+      lookupLabelsByIds(CategoryModel, [campaign.categoryId].filter(Boolean)),
+      lookupLabelsByIds(SubcategoryModel, campaign.subcategoryIds || []),
+      lookupLabelsByIds(InfluencerTierModel, campaign.influencerTierIds || []),
+      lookupLabelsByIds(CampaignGoalModel, campaign.campaignGoals || []),
+      lookupLabelsByIds(ContentFormatModel, campaign.contentFormats || []),
+    ]);
+
+  return {
+    countryLabels,
+    categoryLabels,
+    subcategoryLabels,
+    tierLabels,
+    goalLabels,
+    formatLabels,
+  };
+}
+
+function normalizeCampaignDetailsForRecommendation(campaign = {}, refs = {}, overrides = {}) {
+  const base = normalizeCampaignDetails(campaign || {});
+
+  const campaignTitle = cleanStr(campaign.campaignTitle || campaign.title || campaign.name || base.campaignName);
+  const description = cleanStr(campaign.description || campaign.campaignDescription || campaign.brief);
+  const additionalNotes = cleanStr(campaign.additionalNotes || campaign.notes || campaign.creatorNotes);
+  const campaignBudget = toNum(campaign.campaignBudget ?? campaign.budget ?? campaign.totalBudget ?? overrides.campaignBudget);
+  const paymentType = cleanStr(campaign.paymentType || overrides.paymentType);
+
+  const categoryLabels = uniqueCleanValues([
+    ...(refs.categoryLabels || []),
+    ...(refs.subcategoryLabels || []),
+    ...normalizeLooseArray(campaign.categoryNames),
+    ...normalizeLooseArray(campaign.subcategoryNames),
+    cleanStr(campaign.categoryName),
+    cleanStr(campaign.subcategoryName),
+  ]);
+
+  const countryLabels = uniqueCleanValues([
+    ...(refs.countryLabels || []),
+    ...normalizeLooseArray(campaign.targetCountries),
+    ...normalizeLooseArray(campaign.countries),
+    cleanStr(campaign.targetCountry),
+    cleanStr(campaign.country),
+    cleanStr(overrides.country),
+  ]);
+
+  const tierLabels = uniqueCleanValues([
+    ...(refs.tierLabels || []),
+    ...normalizeLooseArray(campaign.influencerTiers),
+    cleanStr(campaign.influencerTier),
+    cleanStr(overrides.subscriberTier),
+  ]);
+
+  const contentFormats = uniqueCleanValues([
+    ...(refs.formatLabels || []),
+    ...normalizeLooseArray(campaign.contentFormatNames),
+    ...normalizeLooseArray(overrides.contentFormats),
+  ]);
+
+  const campaignGoals = uniqueCleanValues([
+    ...(refs.goalLabels || []),
+    ...normalizeLooseArray(campaign.campaignGoalNames),
+    ...normalizeLooseArray(overrides.campaignGoals),
+  ]);
+
+  const importantTerms = extractImportantCampaignTerms(`${campaignTitle} ${description} ${additionalNotes}`)
+    .filter((term) => !isLowValueCampaignTerm(term));
+  const targetCountry = normalizeCountryLabel(cleanStr(overrides.country) || countryLabels[0] || base.targetCountry);
+  const subscriberTier = cleanStr(overrides.subscriberTier) || detectSubscriberTierFromLabels(tierLabels) || detectSubscriberTierFromBudget(campaignBudget);
+
+  const titleIsGeneric = isGenericCampaignPhrase(campaignTitle);
+  const inferredNiche = importantTerms.slice(0, 2).join(' ');
+
+  const campaignNiche =
+    cleanStr(overrides.category || overrides.niche) ||
+    base.campaignNiche ||
+    categoryLabels[0] ||
+    inferredNiche ||
+    'product review';
+
+  const productName =
+    cleanStr(overrides.keyword || overrides.productName) ||
+    base.productName ||
+    (!titleIsGeneric ? campaignTitle : '') ||
+    campaignNiche ||
+    'product review';
+
+  const rawKeywords = uniqueCleanValues([
+    ...base.keywords.filter((term) => !isLowValueCampaignTerm(term)),
+    !titleIsGeneric ? campaignTitle : '',
+    productName,
+    campaignNiche,
+    ...categoryLabels,
+    ...importantTerms,
+    ...contentFormats,
+    ...campaignGoals,
+  ]).filter((term) => !isLowValueCampaignTerm(term)).slice(0, 30);
+
+  const tierRange = getSubscriberTierRange(subscriberTier);
+
+  return {
+    ...base,
+    campaignId: cleanStr(campaign._id || campaign.id || overrides.campaignId || base.campaignId),
+    brandId: cleanStr(campaign.brandId || overrides.brandId),
+    campaignName: campaignTitle || base.campaignName,
+    campaignTitle,
+    description,
+    additionalNotes,
+    productName,
+    campaignNiche,
+    targetCountry,
+    subscriberTier,
+    minSubscribers: toIntOrNull(overrides.minSubscribers) ?? base.minSubscribers ?? tierRange?.min ?? null,
+    maxSubscribers: toIntOrNull(overrides.maxSubscribers) ?? base.maxSubscribers ?? tierRange?.max ?? null,
+    minAvgViews: toIntOrNull(overrides.minAvgViews) ?? base.minAvgViews ?? MIN_AVG_VIEWS_DEFAULT,
+    campaignBudget,
+    paymentType,
+    productLink: cleanStr(campaign.productLink || overrides.productLink),
+    contentFormats,
+    campaignGoals,
+    targetAgeRanges: uniqueCleanValues([
+      ...normalizeLooseArray(campaign.targetAgeRanges),
+      ...normalizeLooseArray(overrides.targetAgeRanges),
+    ]),
+    categoryLabels,
+    countryLabels,
+    tierLabels,
+    keywords: rawKeywords,
+  };
+}
+
+async function getCampaignRecommendationDetails(campaignId, campaignPayload, overrides = {}) {
+  if (campaignPayload && typeof campaignPayload === 'object') {
+    const refs = await enrichCampaignReferenceLabels(campaignPayload);
+    return {
+      rawCampaign: campaignPayload,
+      campaignDetails: normalizeCampaignDetailsForRecommendation(campaignPayload, refs, {
+        ...overrides,
+        campaignId: campaignId || campaignPayload._id || campaignPayload.id,
+      }),
+    };
+  }
+
+  if (!campaignId) {
+    const err = new Error('campaignId is required');
+    err.status = 400;
+    throw err;
+  }
+
+  if (!Campaign) {
+    const err = new Error('Campaign model not found. Update the Campaign require path in youtubeData.controller.js');
+    err.status = 500;
+    throw err;
+  }
+
+  const rawCampaign = await Campaign.findById(campaignId).lean();
+  if (!rawCampaign) {
+    const err = new Error('Campaign not found');
+    err.status = 404;
+    throw err;
+  }
+
+  const refs = await enrichCampaignReferenceLabels(rawCampaign);
+  return {
+    rawCampaign,
+    campaignDetails: normalizeCampaignDetailsForRecommendation(rawCampaign, refs, {
+      ...overrides,
+      campaignId,
+    }),
+  };
+}
+
 async function getCampaignDetailsById(campaignId) {
   if (!campaignId) return null;
   if (!Campaign) {
@@ -949,61 +1376,97 @@ function buildRequestCampaignDetails(q = {}) {
 }
 
 function buildCampaignSearchQueries(campaignDetails = {}) {
-  const product = cleanStr(campaignDetails.productName);
-  const niche = cleanStr(campaignDetails.campaignNiche);
-  const country = cleanStr(campaignDetails.targetCountry);
-  const baseKeyword = product || niche;
+  const country = normalizeCountryLabel(cleanStr(campaignDetails.targetCountry));
+  const countryName = countrySearchName(country);
 
-  const querySeeds = [
-    ...campaignDetails.keywords,
-    baseKeyword,
-    product,
-    niche,
-    `${baseKeyword} review`,
-    `${baseKeyword} reviews`,
-    `${baseKeyword} unboxing`,
-    `${baseKeyword} comparison`,
-    `${baseKeyword} vs`,
-    `best ${baseKeyword}`,
-    `top ${baseKeyword}`,
-    `${baseKeyword} test`,
-    `${baseKeyword} demo`,
-    `${baseKeyword} buying guide`,
-    `${baseKeyword} product review`,
-    `${baseKeyword} sponsored`,
-    `${baseKeyword} creator`,
-    `${baseKeyword} youtube`,
-    `${baseKeyword} influencer`,
-    `${baseKeyword} setup`,
-    `${baseKeyword} installation`,
-    `${baseKeyword} maintenance`,
-    country ? `${baseKeyword} ${country}` : '',
-    country ? `${baseKeyword} review ${country}` : '',
-    country ? `${baseKeyword} creator ${country}` : '',
-    country ? `best ${baseKeyword} ${country}` : '',
-  ];
+  const rawSeeds = uniqueCleanValues([
+    ...(campaignDetails.keywords || []),
+    campaignDetails.productName,
+    campaignDetails.campaignNiche,
+    ...(campaignDetails.categoryLabels || []),
+    ...(campaignDetails.contentFormats || []),
+    ...(campaignDetails.campaignGoals || []),
+  ]).filter((seed) => !isLowValueCampaignTerm(seed));
 
-  // Expand niche-adjacent terms for low-volume categories like pool cleaner.
-  const lower = baseKeyword.toLowerCase();
-  if (/pool|cleaner|vacuum|lawn|garden|home/.test(lower)) {
+  let baseSeeds = rawSeeds.length ? rawSeeds.slice(0, 8) : [];
+
+  // If campaign title/description are generic (for example "Premium Creator Marketing Campaign"),
+  // use broad brand-safe creator discovery terms instead of searching useless words like "audience".
+  if (!baseSeeds.length || baseSeeds.every((seed) => isGenericCampaignPhrase(seed))) {
+    baseSeeds = [
+      'product review',
+      'lifestyle product review',
+      'unboxing review',
+      'best products',
+      'consumer product review',
+      'gadget review',
+      'home product review',
+      'shopping guide',
+    ];
+  }
+
+  const querySeeds = [];
+
+  for (const base of baseSeeds) {
+    const cleanBase = cleanStr(base);
+    if (!cleanBase) continue;
+
+    querySeeds.push(
+      cleanBase,
+      `${cleanBase} review`,
+      `${cleanBase} reviews`,
+      `${cleanBase} unboxing`,
+      `${cleanBase} comparison`,
+      `best ${cleanBase}`,
+      `top ${cleanBase}`,
+      `${cleanBase} product review`,
+      `${cleanBase} sponsored`,
+      `${cleanBase} creator`,
+      `${cleanBase} youtube`,
+      `${cleanBase} influencer`
+    );
+
+    if (country) {
+      querySeeds.push(
+        `${cleanBase} ${country}`,
+        `${cleanBase} ${countryName}`,
+        `${cleanBase} review ${countryName}`,
+        `${countryName} ${cleanBase} creator`,
+        `${countryName} ${cleanBase} youtuber`,
+        `best ${cleanBase} ${countryName}`
+      );
+    }
+  }
+
+  if (country) {
+    querySeeds.push(
+      `${countryName} product review channel`,
+      `${countryName} product reviewers`,
+      `${countryName} lifestyle creator`,
+      `${countryName} tech review channel`,
+      `${countryName} unboxing channel`,
+      `${countryName} shopping guide youtube`,
+      `${countryName} consumer products review`,
+      `${countryName} creators product review`
+    );
+  }
+
+  // Expand niche-adjacent terms for common product categories and low-volume searches.
+  const lower = baseSeeds.join(' ').toLowerCase();
+  if (/pool|cleaner|vacuum|lawn|garden|home|toilet|bathroom|smart/.test(lower)) {
     querySeeds.push(
       'home improvement product review',
       'smart home product review',
       'outdoor gadget review',
-      'robot vacuum review',
-      'robot lawn mower review',
       'home gadget review',
-      'backyard gadget review',
+      'bathroom product review',
+      'smart bathroom review',
       'home tech review'
     );
   }
 
   return Array.from(new Set(querySeeds.map(cleanStr).filter(Boolean))).slice(0, MAX_SEARCH_QUERIES);
 }
-
-/* -------------------------------------------------------------------------- */
-/*                         YouTube Data API calls                              */
-/* -------------------------------------------------------------------------- */
 
 async function searchVideoCreatorChannels(
   query,
@@ -1134,6 +1597,7 @@ function buildCreatorDoc(channel, videos, campaignDetails, discoveryInfo, allSea
   const stats = channel?.statistics || {};
   const topic = channel?.topicDetails || {};
   const branding = channel?.brandingSettings?.channel || {};
+  const brandingImage = channel?.brandingSettings?.image || {};
   const topicCategories = Array.isArray(topic.topicCategories) ? topic.topicCategories : [];
   const requestedCategory = cleanStr(campaignDetails?.campaignNiche) || cleanStr(discoveryInfo?.requestedCategory) || cleanStr(discoveryInfo?.foundViaQuery);
   const youtubeCategory = topicCategories.length > 0 ? labelFromWikiUrl(topicCategories[0]) : '';
@@ -1167,6 +1631,7 @@ function buildCreatorDoc(channel, videos, campaignDetails, discoveryInfo, allSea
     channelName: cleanStr(snippet.title),
     channelUrl: channelUrlFor(channel.id, snippet.customUrl),
     thumbnail: pickThumb(snippet.thumbnails),
+    bannerImage: cleanStr(brandingImage.bannerExternalUrl || brandingImage.bannerMobileImageUrl || brandingImage.bannerTabletImageUrl || ''),
     sourceVideoTitle: discoveryInfo?.sourceVideoTitle || '',
     sourceVideoUrl: discoveryInfo?.sourceVideoUrl || '',
     foundViaQuery: discoveryInfo?.foundViaQuery || '',
@@ -1828,6 +2293,7 @@ function buildBrandMediaKitData(creator, context = {}) {
       creatorName: creator.channelName,
       channelName: creator.channelName,
       profilePhoto: creator.thumbnail,
+      bannerImage: creator.bannerImage || creator.channelBannerImage || creator.coverImage || '',
       category: creator.category || creator.channelCategory || 'YouTube Creator',
       creatorTier: getTierFromSubscribers(creator.subscribers),
       primaryLanguage: creator.primaryLanguage || 'Unknown',
@@ -1938,9 +2404,946 @@ function buildBrandMediaKitData(creator, context = {}) {
     contact,
     collabGlamRecommendation: {
       recommendation: getCampaignFitLabel(campaignFitScore),
-      summary: `${creator.channelName} is a ${getTierFromSubscribers(creator.subscribers)} YouTube creator with ${avgViews.toLocaleString()} average views and a ${campaignFitScore}/100 campaign fit score for this search.`,
+      summary: `${creator.channelName} is a ${getTierFromSubscribers(creator.subscribers)} YouTube creator with ${avgViews.toLocaleString()} average views and a ${campaignFitScore}/100 match score for this search.`,
     },
   };
+}
+
+
+
+const MIN_RECOMMENDED_INFLUENCER_TARGET = 50;
+
+function getMinimumRecommendedInfluencerTarget(limit) {
+  const safeLimit = Math.max(1, Number(limit || 0) || MIN_RECOMMENDED_INFLUENCER_TARGET);
+  return Math.min(MIN_RECOMMENDED_INFLUENCER_TARGET, safeLimit);
+}
+
+function hasCampaignTierRequest(campaignDetails = {}, minSubscribers = null, maxSubscribers = null) {
+  return Boolean(
+    cleanStr(campaignDetails.subscriberTier) ||
+      minSubscribers != null ||
+      maxSubscribers != null
+  );
+}
+
+function getRecommendationRowSubscribers(row = {}) {
+  return Number(
+    row.creatorSnapshot?.subscribers ??
+      row.subscribers ??
+      row.followers ??
+      row.doc?.subscribers ??
+      0
+  );
+}
+
+function isRecommendationRowTierMatch(row = {}, minSubscribers = null, maxSubscribers = null) {
+  if (minSubscribers == null && maxSubscribers == null) return true;
+  return isSubscriberTierMatch(getRecommendationRowSubscribers(row), minSubscribers, maxSubscribers);
+}
+
+function getRecommendationRowChannelKey(row = {}) {
+  return cleanStr(row.channelId || row.doc?.channelId || row.ids?.youtubeChannelId || row._id).toLowerCase();
+}
+
+function sortRecommendationRowsForTier(rows = [], { minSubscribers = null, maxSubscribers = null, campaignDetails = {}, strictTier = false, limit = 100 } = {}) {
+  const minimumTarget = getMinimumRecommendedInfluencerTarget(limit);
+  const hasTierRequest = hasCampaignTierRequest(campaignDetails, minSubscribers, maxSubscribers);
+  const safeRows = Array.isArray(rows) ? rows : [];
+
+  if (!hasTierRequest) return safeRows.slice(0, limit);
+
+  const tierRows = safeRows.filter((row) => isRecommendationRowTierMatch(row, minSubscribers, maxSubscribers));
+  const extraRows = safeRows.filter((row) => !isRecommendationRowTierMatch(row, minSubscribers, maxSubscribers));
+
+  // Tier must be respected first. Only fill outside the selected tier when we cannot reach
+  // the 50-influencer target and strictTier is not explicitly enabled.
+  if (strictTier || tierRows.length >= minimumTarget) return tierRows.slice(0, limit);
+
+  return [...tierRows, ...extraRows].slice(0, Math.min(limit, minimumTarget));
+}
+
+function mergeRecommendationRows(primary = [], secondary = [], limit = 100) {
+  const merged = [];
+  const seen = new Set();
+
+  for (const row of [...(primary || []), ...(secondary || [])]) {
+    const key = getRecommendationRowChannelKey(row);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    merged.push(row);
+    if (merged.length >= limit) break;
+  }
+
+  return merged;
+}
+
+function getRecommendationCountStatus(rows = [], limit = 100, campaignDetails = {}, minSubscribers = null, maxSubscribers = null) {
+  const minimumTarget = getMinimumRecommendedInfluencerTarget(limit);
+  const tierRequested = hasCampaignTierRequest(campaignDetails, minSubscribers, maxSubscribers);
+  const tierMatchedCount = tierRequested
+    ? rows.filter((row) => isRecommendationRowTierMatch(row, minSubscribers, maxSubscribers)).length
+    : rows.length;
+
+  return {
+    minimumInfluencerTarget: minimumTarget,
+    hasMinimumInfluencers: rows.length >= minimumTarget,
+    selectedTierMatchedCount: tierMatchedCount,
+    selectedTierRequested: tierRequested,
+    selectedTierRespected: !tierRequested || tierMatchedCount >= Math.min(rows.length, minimumTarget),
+  };
+}
+
+function getBudgetTierScore(subscribers, campaignDetails = {}) {
+  const requestedRange = getSubscriberTierRange(campaignDetails.subscriberTier);
+  if (requestedRange) {
+    return isSubscriberTierMatch(subscribers, requestedRange.min, requestedRange.max) ? 100 : 55;
+  }
+
+  const budgetTier = detectSubscriberTierFromBudget(campaignDetails.campaignBudget);
+  const budgetRange = getSubscriberTierRange(budgetTier);
+  if (!budgetRange) return 75;
+
+  return isSubscriberTierMatch(subscribers, budgetRange.min, budgetRange.max) ? 100 : 60;
+}
+
+function getCountryScoreForRecommendation(doc, campaignDetails = {}) {
+  const target = normalizeCountryLabel(campaignDetails.targetCountry).toUpperCase();
+  if (!target) return 80;
+
+  const actual = cleanStr(doc.country).toUpperCase();
+  if (actual && actual === target) return 100;
+
+  const estimated = cleanStr(doc.estimatedAudienceCountry).toUpperCase();
+  if (estimated && estimated === target) return 60;
+
+  return 0;
+}
+
+function calculateRecommendationScore(doc, discovery, campaignDetails = {}) {
+  const scores = doc.scores || discovery.scores || {};
+  const relevancyScore = scoreValue(scores.relevancyScore || discovery.shortlist?.score || 70, 70);
+  const engagementScore = scoreValue(scores.engagementScore || 0, 0);
+  const sponsorshipScore = scoreValue(scores.sponsorshipScore || 0, 0);
+  const brandSafetyScore = scoreValue(scores.brandSafetyScore || 90, 90);
+  const countryScore = getCountryScoreForRecommendation(doc, campaignDetails);
+  const tierScore = getBudgetTierScore(doc.subscribers, campaignDetails);
+
+  return Math.round(
+    relevancyScore * 0.35 +
+      countryScore * 0.2 +
+      tierScore * 0.15 +
+      engagementScore * 0.15 +
+      brandSafetyScore * 0.1 +
+      sponsorshipScore * 0.05
+  );
+}
+
+function buildRecommendationReason(doc, discovery, campaignDetails, recommendationScore) {
+  const parts = [];
+  const keyword = cleanStr(campaignDetails.productName || campaignDetails.campaignNiche || discovery.category);
+  const country = cleanStr(campaignDetails.targetCountry);
+  const tier = cleanStr(campaignDetails.subscriberTier || getTierFromSubscribers(doc.subscribers));
+
+  if (keyword) parts.push(`Matched campaign topic: ${keyword}`);
+  if (country && cleanStr(doc.country).toUpperCase() === country.toUpperCase()) {
+    parts.push(`Creator country matches ${country}`);
+  }
+  if (tier) parts.push(`Best suited for ${tier} creator targeting`);
+  if (doc.avgViews) parts.push(`${Number(doc.avgViews).toLocaleString()} average views`);
+  if (doc.engagementRate) parts.push(`${doc.engagementRate}% engagement rate`);
+  parts.push(`${recommendationScore}/100 recommendation score`);
+
+  return parts.join(' | ');
+}
+
+function buildCampaignInfluencerPayload(doc, discovery, campaignDetails, recommendationScore) {
+  const mediaKit = buildBrandMediaKitData(doc, {
+    keyword: campaignDetails.productName,
+    category: campaignDetails.campaignNiche,
+    country: campaignDetails.targetCountry,
+  });
+
+  const recommendationReason = buildRecommendationReason(
+    doc,
+    discovery,
+    campaignDetails,
+    recommendationScore
+  );
+
+  return {
+    platform: 'youtube',
+    channelId: doc.channelId,
+    channelUrl: doc.channelUrl,
+    channelName: doc.channelName,
+    thumbnail: doc.thumbnail,
+    creatorSnapshot: {
+      subscribers: doc.subscribers,
+      creatorTier: getTierFromSubscribers(doc.subscribers),
+      category: doc.category || doc.channelCategory,
+      country: doc.country,
+      estimatedAudienceCountry: doc.estimatedAudienceCountry,
+      primaryLanguage: doc.primaryLanguage,
+      totalViews: doc.totalViews,
+      totalVideos: doc.totalVideos,
+      avgViews: doc.avgViews,
+      avgLikes: doc.avgLikes,
+      avgComments: doc.avgComments,
+      engagementRate: doc.engagementRate,
+      recentUploadDate: doc.recentUploadDate,
+      description: doc.description,
+    },
+    scores: {
+      recommendationScore,
+      campaignFitScore: mediaKit.performanceScores?.campaignFitScore || recommendationScore,
+      relevancyScore: doc.scores?.relevancyScore || discovery.scores?.relevancyScore || 0,
+      engagementScore: doc.scores?.engagementScore || 0,
+      sponsorshipScore: doc.scores?.sponsorshipScore || 0,
+      brandSafetyScore: doc.scores?.brandSafetyScore || 0,
+      authenticityScore: doc.scores?.authenticityScore || discovery.scores?.authenticityScore || mediaKit.performanceScores?.authenticityScore || 85,
+      audienceCountryConfidence: doc.scores?.audienceCountryConfidence || 0,
+      nicheFit: doc.scores?.nicheFit || discovery.shortlist?.nicheFit || 0,
+    },
+    recommendationReason,
+    contact: mediaKit.contact,
+    rawYouTubeDataId: doc._id,
+    campaignContext: {
+      campaignId: campaignDetails.campaignId,
+      brandId: campaignDetails.brandId,
+      campaignTitle: campaignDetails.campaignTitle || campaignDetails.campaignName,
+      campaignDescription: cleanStr(campaignDetails.description).slice(0, 500),
+      campaignBudget: campaignDetails.campaignBudget || 0,
+      paymentType: campaignDetails.paymentType,
+      targetCountry: campaignDetails.targetCountry,
+      requestedTier: campaignDetails.subscriberTier,
+      contentFormats: campaignDetails.contentFormats || [],
+      campaignGoals: campaignDetails.campaignGoals || [],
+      targetAgeRanges: campaignDetails.targetAgeRanges || [],
+      matchedKeyword: campaignDetails.productName || campaignDetails.campaignNiche,
+      matchedCategory: campaignDetails.campaignNiche,
+      sourceVideoTitle: doc.sourceVideoTitle || discovery.sourceVideoTitle || '',
+      sourceVideoUrl: doc.sourceVideoUrl || discovery.sourceVideoUrl || '',
+      foundViaQuery: doc.foundViaQuery || discovery.foundViaQuery || '',
+      recommendationScore,
+      recommendationReason,
+      matchedAt: new Date(),
+    },
+  };
+}
+
+async function upsertCampaignInfluencerRecommendation(payload) {
+  if (!CampaignInfluencer) {
+    return { ...payload, saved: false, saveWarning: 'CampaignInfluencer model not found' };
+  }
+
+  const campaignObjectId = toObjectIdOrNull(payload.campaignContext.campaignId);
+  const brandObjectId = toObjectIdOrNull(payload.campaignContext.brandId);
+  const campaignContext = {
+    ...payload.campaignContext,
+    campaignId: campaignObjectId || payload.campaignContext.campaignId,
+    brandId: brandObjectId || payload.campaignContext.brandId,
+  };
+
+  const existing = await CampaignInfluencer.findOne({ channelId: payload.channelId });
+
+  if (!existing) {
+    const doc = await CampaignInfluencer.create({
+      platform: payload.platform,
+      channelId: payload.channelId,
+      channelUrl: payload.channelUrl,
+      channelName: payload.channelName,
+      thumbnail: payload.thumbnail,
+      campaignIds: campaignObjectId ? [campaignObjectId] : [],
+      brandIds: brandObjectId ? [brandObjectId] : [],
+      creatorSnapshot: payload.creatorSnapshot,
+      scores: payload.scores,
+      recommendationReason: payload.recommendationReason,
+      campaignContexts: [campaignContext],
+      contact: payload.contact,
+      rawYouTubeDataId: payload.rawYouTubeDataId,
+      lastRecommendedAt: new Date(),
+    });
+
+    return { ...payload, _id: doc._id, saved: true };
+  }
+
+  existing.platform = payload.platform;
+  existing.channelUrl = payload.channelUrl;
+  existing.channelName = payload.channelName;
+  existing.thumbnail = payload.thumbnail;
+  existing.creatorSnapshot = payload.creatorSnapshot;
+  existing.scores = payload.scores;
+  existing.recommendationReason = payload.recommendationReason;
+  existing.contact = payload.contact;
+  existing.rawYouTubeDataId = payload.rawYouTubeDataId;
+  existing.lastRecommendedAt = new Date();
+
+  if (campaignObjectId && !existing.campaignIds.some((id) => String(id) === String(campaignObjectId))) {
+    existing.campaignIds.push(campaignObjectId);
+  }
+
+  if (brandObjectId && !existing.brandIds.some((id) => String(id) === String(brandObjectId))) {
+    existing.brandIds.push(brandObjectId);
+  }
+
+  existing.campaignContexts = (existing.campaignContexts || []).filter(
+    (ctx) => String(ctx.campaignId) !== String(campaignObjectId || payload.campaignContext.campaignId)
+  );
+  existing.campaignContexts.push(campaignContext);
+
+  await existing.save();
+
+  return { ...payload, _id: existing._id, saved: true };
+}
+
+function getRecommendationAudienceAuthenticityScore(saved = {}) {
+  const rawScore = Number(
+    saved.audienceAuthenticity ||
+      saved.audienceAuthenticityScore ||
+      saved.authenticityScore ||
+      saved.scores?.audienceAuthenticity ||
+      saved.scores?.audienceAuthenticityScore ||
+      saved.scores?.authenticityScore ||
+      saved.creatorSnapshot?.audienceAuthenticity ||
+      0
+  );
+
+  if (Number.isFinite(rawScore) && rawScore > 0) {
+    return Math.max(0, Math.min(100, Math.round(rawScore)));
+  }
+
+  // Fallback for older saved CampaignInfluencer rows that were created before
+  // audience authenticity was added to the public response.
+  const subscribers = Number(saved.creatorSnapshot?.subscribers || 0);
+  const avgViews = Number(saved.creatorSnapshot?.avgViews || 0);
+  const engagementRate = Number(saved.creatorSnapshot?.engagementRate || 0);
+  const recentUploadDate = saved.creatorSnapshot?.recentUploadDate;
+  const hasCountry = Boolean(cleanStr(saved.creatorSnapshot?.country || saved.creatorSnapshot?.estimatedAudienceCountry));
+
+  let score = 78;
+
+  if (engagementRate >= 5) score += 8;
+  else if (engagementRate >= 2) score += 5;
+  else if (engagementRate > 0 && engagementRate < 0.5) score -= 12;
+
+  const viewSubscriberRatio = subscribers > 0 ? (avgViews / subscribers) * 100 : 0;
+  if (viewSubscriberRatio >= 10) score += 7;
+  else if (viewSubscriberRatio >= 3) score += 4;
+  else if (viewSubscriberRatio > 0 && viewSubscriberRatio < 0.3) score -= 8;
+
+  if (recentUploadDate) {
+    const daysSinceUpload = daysBetween(recentUploadDate, new Date());
+    if (daysSinceUpload <= 180) score += 6;
+    else score -= 6;
+  }
+
+  if (hasCountry) score += 4;
+  else score -= 5;
+
+  return Math.max(35, Math.min(95, Math.round(score)));
+}
+
+function campaignRecommendationDTO(saved) {
+  const audienceAuthenticity = getRecommendationAudienceAuthenticityScore(saved);
+
+  return {
+    _id: saved._id,
+    saved: saved.saved,
+    platform: 'youtube',
+    source: 'youtube_api',
+    channelId: saved.channelId,
+    channelName: saved.channelName,
+    name: saved.channelName,
+    handle: '',
+    channelUrl: saved.channelUrl,
+    thumbnail: saved.thumbnail,
+    picture: saved.thumbnail,
+    subscribers: saved.creatorSnapshot?.subscribers || 0,
+    followers: saved.creatorSnapshot?.subscribers || 0,
+    creatorTier: saved.creatorSnapshot?.creatorTier || getTierFromSubscribers(saved.creatorSnapshot?.subscribers),
+    tier: {
+      key: saved.creatorSnapshot?.creatorTier || getTierFromSubscribers(saved.creatorSnapshot?.subscribers),
+      label: saved.creatorSnapshot?.creatorTier || getTierFromSubscribers(saved.creatorSnapshot?.subscribers),
+    },
+    category: saved.creatorSnapshot?.category || '',
+    country: saved.creatorSnapshot?.country || '',
+    estimatedAudienceCountry: saved.creatorSnapshot?.estimatedAudienceCountry || '',
+    primaryLanguage: saved.creatorSnapshot?.primaryLanguage || '',
+    avgViews: saved.creatorSnapshot?.avgViews || 0,
+    engagementRate: saved.creatorSnapshot?.engagementRate || 0,
+    recentUploadDate: saved.creatorSnapshot?.recentUploadDate || null,
+    audienceAuthenticity,
+    authenticityScore: audienceAuthenticity,
+    stats: {
+      averageViews: saved.creatorSnapshot?.avgViews || 0,
+      engagementRate: saved.creatorSnapshot?.engagementRate || 0,
+      authenticityScore: audienceAuthenticity,
+    },
+    scores: {
+      recommendationScore: saved.scores?.recommendationScore || 0,
+      campaignFitScore: saved.scores?.campaignFitScore || saved.scores?.recommendationScore || 0,
+      authenticityScore: audienceAuthenticity,
+      audienceAuthenticityScore: audienceAuthenticity,
+      engagementScore: saved.scores?.engagementScore || 0,
+      brandSafetyScore: saved.scores?.brandSafetyScore || 0,
+      relevancyScore: saved.scores?.relevancyScore || 0,
+    },
+    aiScore: saved.scores?.recommendationScore || 0,
+    rawAiScore: saved.scores?.recommendationScore || 0,
+    recommendationScore: saved.scores?.recommendationScore || 0,
+    ids: {
+      youtubeChannelId: saved.channelId,
+      modashId: saved.channelId,
+    },
+  };
+}
+
+
+function buildRecommendationChannelNamePayload(rowsOrDtos = [], minimum = 50) {
+  const items = [];
+  const seen = new Set();
+
+  for (const row of Array.isArray(rowsOrDtos) ? rowsOrDtos : []) {
+    const channelName = cleanStr(row.channelName || row.name || row.creatorSnapshot?.channelName);
+    if (!channelName) continue;
+
+    const key = channelName.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    items.push({
+      channelName,
+      tier: cleanStr(row.creatorTier || row.tier?.label || row.creatorSnapshot?.creatorTier),
+      country: cleanStr(row.country || row.creatorSnapshot?.country),
+      subscribers: Number(row.subscribers || row.followers || row.creatorSnapshot?.subscribers || 0),
+      recommendationScore: Number(row.recommendationScore || row.aiScore || row.scores?.recommendationScore || 0),
+    });
+
+    if (items.length >= minimum) break;
+  }
+
+  return {
+    channelNames: items.map((item) => item.channelName),
+    channelNameItems: items,
+    channelNameCount: items.length,
+    minimumChannelNameTarget: minimum,
+    hasMinimumChannelNames: items.length >= minimum,
+  };
+}
+
+
+function campaignRecommendationJobKey({ campaignId, brandId, keyword, category, country, subscriberTier }) {
+  return [
+    cleanStr(campaignId),
+    cleanStr(brandId),
+    cleanStr(keyword).toLowerCase(),
+    cleanStr(category).toLowerCase(),
+    cleanStr(country).toUpperCase(),
+    cleanStr(subscriberTier).toLowerCase(),
+  ].join('|');
+}
+
+async function getSavedCampaignRecommendationRows(campaignId, brandId, limit = 100) {
+  if (!CampaignInfluencer) return [];
+
+  const campaignObjectId = toObjectIdOrNull(campaignId);
+  const brandObjectId = toObjectIdOrNull(brandId);
+
+  const or = [];
+  if (campaignObjectId) or.push({ campaignIds: campaignObjectId });
+  if (campaignId) or.push({ 'campaignContexts.campaignId': campaignObjectId || campaignId });
+
+  if (!or.length) return [];
+
+  const filter = {
+    platform: 'youtube',
+    $or: or,
+  };
+
+  if (brandObjectId) {
+    filter.$and = [{ $or: [{ brandIds: brandObjectId }, { 'campaignContexts.brandId': brandObjectId }] }];
+  }
+
+  const rows = await CampaignInfluencer.find(filter)
+    .sort({ 'scores.recommendationScore': -1, lastRecommendedAt: -1, updatedAt: -1 })
+    .limit(Math.min(500, Math.max(1, limit)))
+    .lean();
+
+  return rows.map((row) => ({ ...row, saved: true }));
+}
+
+async function buildCampaignRecommendationRowsFromCache({
+  keyword,
+  category,
+  country,
+  minSubscribers,
+  maxSubscribers,
+  campaignDetails,
+  includeExcluded,
+  strictTier,
+  limit,
+  shouldSave,
+}) {
+  const activeSinceDate = getCreatorLookbackStartDate();
+  const minimumTarget = getMinimumRecommendedInfluencerTarget(limit);
+  const hasTierRequest = hasCampaignTierRequest(campaignDetails, minSubscribers, maxSubscribers);
+
+  // Always load a wider soft-tier pool first so the API can return at least 50 creators.
+  // The selected tier is still respected by ranking tier matches first, and by returning
+  // only selected-tier rows when at least 50 are available.
+  const filter = buildMongoFilter({
+    keyword,
+    country,
+    minSubscribers: strictTier ? minSubscribers : null,
+    maxSubscribers: strictTier ? maxSubscribers : null,
+    minAvgViews: campaignDetails.minAvgViews,
+    minEngagement: null,
+    category,
+    campaignId: '',
+    includeExcluded,
+    strictFilters: strictTier,
+    activeSinceDate,
+  });
+
+  const context = {
+    keyword,
+    category,
+    country,
+    minSubscribers,
+    maxSubscribers,
+    subscriberTier: campaignDetails.subscriberTier,
+    strictFilters: strictTier,
+  };
+
+  const docs = await YouTubeData.find(filter)
+    .sort(SORT_MAP.relevance)
+    .limit(Math.min(1000, Math.max(limit * 10, TARGET_CHANNELS_PER_SEARCH, minimumTarget * 8)))
+    .lean();
+
+  const ranked = docs
+    .map((doc) => {
+      const discovery = creatorListDTO(doc, context);
+      const recommendationScore = calculateRecommendationScore(doc, discovery, campaignDetails);
+      return {
+        doc,
+        discovery,
+        recommendationScore,
+        tierMatch: isSubscriberTierMatch(doc.subscribers, minSubscribers, maxSubscribers) ? 1 : 0,
+        countryMatch: isCountryMatchForFilter(doc, country) ? 1 : 0,
+      };
+    })
+    .filter((row) => !country || row.countryMatch)
+    .sort((a, b) => {
+      if (a.countryMatch !== b.countryMatch) return b.countryMatch - a.countryMatch;
+      if (hasTierRequest && a.tierMatch !== b.tierMatch) return b.tierMatch - a.tierMatch;
+      if (a.recommendationScore !== b.recommendationScore) return b.recommendationScore - a.recommendationScore;
+      return Number(b.doc.subscribers || 0) - Number(a.doc.subscribers || 0);
+    });
+
+  let selectedRanked = ranked;
+
+  if (hasTierRequest) {
+    const tierRanked = ranked.filter((row) => row.tierMatch);
+    const extraRanked = ranked.filter((row) => !row.tierMatch);
+
+    if (strictTier || tierRanked.length >= minimumTarget) {
+      selectedRanked = tierRanked;
+    } else {
+      // Selected tier was too small. Fill only enough extra creators to reach the
+      // minimum target, not the full 100, so tier remains the priority.
+      selectedRanked = [...tierRanked, ...extraRanked].slice(0, minimumTarget);
+    }
+  }
+
+  selectedRanked = selectedRanked.slice(0, limit);
+
+  const rows = [];
+  for (const row of selectedRanked) {
+    const payload = buildCampaignInfluencerPayload(
+      row.doc,
+      row.discovery,
+      campaignDetails,
+      row.recommendationScore
+    );
+
+    if (shouldSave) {
+      rows.push(await upsertCampaignInfluencerRecommendation(payload));
+    } else {
+      rows.push({ ...payload, saved: false });
+    }
+  }
+
+  return rows;
+}
+
+async function runCampaignRecommendationBackgroundJob(args) {
+  const {
+    jobKey,
+    campaignDetails,
+    keyword,
+    category,
+    country,
+    minSubscribers,
+    maxSubscribers,
+    includeExcluded,
+    strictTier,
+    limit,
+    shouldSave,
+  } = args;
+
+  try {
+    await refreshChannelsForCampaign({
+      ...campaignDetails,
+      productName: campaignDetails.productName || keyword,
+      campaignNiche: category || keyword,
+      targetCountry: country,
+      minSubscribers,
+      maxSubscribers,
+      minAvgViews: campaignDetails.minAvgViews,
+      strictFilters: strictTier,
+      strictCountry: Boolean(country),
+      targetSaveCount: Math.min(RAW_CHANNELS_PER_SEARCH, Math.max(limit * 5, TARGET_CHANNELS_PER_SEARCH)),
+      keywords: uniqueCleanValues([
+        ...(campaignDetails.keywords || []),
+        keyword,
+        category,
+        campaignDetails.campaignTitle,
+        campaignDetails.description,
+      ]).slice(0, 30),
+    });
+
+    await buildCampaignRecommendationRowsFromCache({
+      keyword,
+      category,
+      country,
+      minSubscribers,
+      maxSubscribers,
+      campaignDetails,
+      includeExcluded,
+      strictTier,
+      limit,
+      shouldSave,
+    });
+  } catch (err) {
+    // Background job must never break the API response path.
+    // It will be visible in server logs and can be retried from the frontend.
+    console.error('[YouTube campaign recommendation background job failed]', err?.message || err);
+  } finally {
+    CAMPAIGN_RECOMMENDATION_JOBS.delete(jobKey);
+  }
+}
+
+function getCampaignRecommendationJobStatus(jobKey) {
+  if (!jobKey) return null;
+  const job = CAMPAIGN_RECOMMENDATION_JOBS.get(jobKey);
+  if (!job) return null;
+
+  const ageMs = Date.now() - Number(job.startedAt || 0);
+  if (ageMs > CAMPAIGN_RECOMMENDATION_JOB_TTL_MS) {
+    CAMPAIGN_RECOMMENDATION_JOBS.delete(jobKey);
+    return null;
+  }
+
+  return {
+    status: 'running',
+    startedAt: job.startedAt,
+    ageMs,
+  };
+}
+
+function startCampaignRecommendationBackgroundJob(args) {
+  const jobKey = args.jobKey;
+  if (!jobKey) {
+    return { started: false, alreadyRunning: false, status: null };
+  }
+
+  const force = Boolean(args.forceBackground);
+  const existing = CAMPAIGN_RECOMMENDATION_JOBS.get(jobKey);
+  if (existing) {
+    const ageMs = Date.now() - Number(existing.startedAt || 0);
+
+    if (!force && ageMs <= CAMPAIGN_RECOMMENDATION_JOB_TTL_MS) {
+      return {
+        started: false,
+        alreadyRunning: true,
+        status: { status: 'running', startedAt: existing.startedAt, ageMs },
+      };
+    }
+
+    CAMPAIGN_RECOMMENDATION_JOBS.delete(jobKey);
+  }
+
+  CAMPAIGN_RECOMMENDATION_JOBS.set(jobKey, { startedAt: Date.now() });
+  setImmediate(() => {
+    runCampaignRecommendationBackgroundJob(args).catch((err) => {
+      CAMPAIGN_RECOMMENDATION_JOBS.delete(jobKey);
+      console.error('[YouTube campaign recommendation background job crashed]', err?.message || err);
+    });
+  });
+
+  return { started: true, alreadyRunning: false, status: getCampaignRecommendationJobStatus(jobKey) };
+}
+
+async function recommendCreatorsForCampaign(req, res) {
+  try {
+    const q = { ...req.query, ...req.body };
+    const campaignId = cleanStr(req.params.campaignId || q.campaignId || q.campaign?._id || q.campaign?.id);
+    const brandId = cleanStr(q.brandId || q.campaign?.brandId);
+    const limit = Math.min(250, Math.max(1, toIntOrNull(q.limit) || 100));
+    const includeExcluded = String(q.includeExcluded || '').toLowerCase() === 'true';
+    const strictCountry = String(q.strictCountry ?? 'true').toLowerCase() !== 'false';
+    const strictTier = String(q.strictTier || q.strictFilters || '').toLowerCase() === 'true';
+    const shouldSave = String(q.save ?? 'true').toLowerCase() !== 'false';
+
+    // Fast/non-blocking mode avoids frontend 40s axios timeout.
+    // It returns saved/cached recommendations immediately and refreshes YouTube in the background.
+    const fastMode = ['true', '1', 'yes'].includes(
+      String(q.fast || q.background || q.nonBlocking || q.async || '').toLowerCase()
+    );
+    const allowBackground = String(q.background ?? 'true').toLowerCase() !== 'false';
+    const forceBackground = ['true', '1', 'yes'].includes(
+      String(q.forceBackground || q.restartBackground || q.force || '').toLowerCase()
+    );
+    const refreshLive = !fastMode && String(q.refresh ?? 'true').toLowerCase() !== 'false';
+
+    const { rawCampaign, campaignDetails } = await getCampaignRecommendationDetails(
+      campaignId,
+      q.campaign,
+      {
+        ...q,
+        campaignId,
+        brandId,
+      }
+    );
+
+    if (brandId && !campaignDetails.brandId) campaignDetails.brandId = brandId;
+
+    const country = normalizeCountryLabel(cleanStr(q.country) || campaignDetails.targetCountry);
+    const tierRange = getSubscriberTierRange(campaignDetails.subscriberTier || q.subscriberTier);
+    const minSubscribers = tierRange?.min ?? campaignDetails.minSubscribers ?? null;
+    const maxSubscribers = tierRange?.max ?? campaignDetails.maxSubscribers ?? null;
+    let keyword = cleanStr(q.keyword || q.search) || campaignDetails.productName || campaignDetails.campaignNiche;
+    let category = cleanStr(q.category || q.niche) || campaignDetails.campaignNiche;
+
+    if (isLowValueCampaignTerm(keyword)) keyword = category || 'product review';
+    if (isLowValueCampaignTerm(category)) category = keyword || 'product review';
+
+    const normalizedCampaignDetails = {
+      ...campaignDetails,
+      campaignId,
+      brandId: campaignDetails.brandId || brandId,
+      productName: campaignDetails.productName || keyword,
+      campaignNiche: category || keyword,
+      targetCountry: strictCountry ? country : country,
+      minSubscribers,
+      maxSubscribers,
+      subscriberTier: campaignDetails.subscriberTier || q.subscriberTier,
+      keywords: uniqueCleanValues([
+        ...(campaignDetails.keywords || []),
+        keyword,
+        category,
+        campaignDetails.campaignTitle,
+        campaignDetails.description,
+      ]).slice(0, 30),
+    };
+
+    const jobKey = campaignRecommendationJobKey({
+      campaignId,
+      brandId: normalizedCampaignDetails.brandId,
+      keyword,
+      category,
+      country,
+      subscriberTier: normalizedCampaignDetails.subscriberTier,
+    });
+    const minimumTarget = getMinimumRecommendedInfluencerTarget(limit);
+
+    let refreshedCount = 0;
+    let liveError = null;
+    let backgroundStarted = false;
+    let backgroundAlreadyRunning = false;
+    let backgroundJobStatus = null;
+
+    if (fastMode) {
+      let rows = [];
+
+      // 1) Prefer already saved recommendations for this campaign.
+      const savedRows = await getSavedCampaignRecommendationRows(
+        campaignId,
+        normalizedCampaignDetails.brandId,
+        Math.max(limit * 3, minimumTarget * 3)
+      );
+
+      if (savedRows.length) {
+        rows = sortRecommendationRowsForTier(savedRows, {
+          minSubscribers,
+          maxSubscribers,
+          campaignDetails: normalizedCampaignDetails,
+          strictTier,
+          limit,
+        });
+      }
+
+      // 2) If no campaign-specific saved rows exist, or saved rows are below the
+      // 50-influencer target, build from cached YouTubeData only.
+      if (rows.length < minimumTarget) {
+        const cacheRows = await buildCampaignRecommendationRowsFromCache({
+          keyword,
+          category,
+          country,
+          minSubscribers,
+          maxSubscribers,
+          campaignDetails: normalizedCampaignDetails,
+          includeExcluded,
+          strictTier,
+          limit,
+          shouldSave,
+        });
+
+        rows = sortRecommendationRowsForTier(
+          mergeRecommendationRows(rows, cacheRows, limit),
+          {
+            minSubscribers,
+            maxSubscribers,
+            campaignDetails: normalizedCampaignDetails,
+            strictTier,
+            limit,
+          }
+        );
+      }
+
+      if (allowBackground && rows.length < minimumTarget) {
+        const bg = startCampaignRecommendationBackgroundJob({
+          jobKey,
+          campaignDetails: normalizedCampaignDetails,
+          keyword,
+          category,
+          country,
+          minSubscribers,
+          maxSubscribers,
+          includeExcluded,
+          strictTier,
+          limit,
+          shouldSave,
+          forceBackground,
+        });
+        backgroundStarted = bg.started;
+        backgroundAlreadyRunning = bg.alreadyRunning;
+        backgroundJobStatus = bg.status;
+      }
+
+      const dtoRows = rows.map(campaignRecommendationDTO);
+      const channelNamePayload = buildRecommendationChannelNamePayload(dtoRows, minimumTarget);
+      const recommendationCountStatus = getRecommendationCountStatus(rows, limit, normalizedCampaignDetails, minSubscribers, maxSubscribers);
+      const statusCode = rows.length >= minimumTarget || !allowBackground ? 200 : 202;
+      return res.status(statusCode).json({
+        success: true,
+        source: 'youtube_api',
+        mode: 'fast',
+        processing: backgroundStarted || backgroundAlreadyRunning || rows.length < minimumTarget,
+        backgroundStarted,
+        backgroundAlreadyRunning,
+        backgroundJobStatus,
+        campaignId,
+        brandId: normalizedCampaignDetails.brandId,
+        refreshedCount: 0,
+        savedCount: rows.filter((row) => row.saved).length,
+        returnedCount: rows.length,
+        recommendationBasis: {
+          campaignTitle: normalizedCampaignDetails.campaignTitle,
+          descriptionUsed: Boolean(normalizedCampaignDetails.description),
+          budget: normalizedCampaignDetails.campaignBudget || 0,
+          paymentType: normalizedCampaignDetails.paymentType || '',
+          targetCountry: country,
+          subscriberTier: normalizedCampaignDetails.subscriberTier || '',
+          strictCountry,
+          strictTier,
+          minimumInfluencerTarget: minimumTarget,
+          keywords: normalizedCampaignDetails.keywords || [],
+        },
+        ...channelNamePayload,
+        ...recommendationCountStatus,
+        data: dtoRows,
+        rawCampaign: {
+          _id: rawCampaign?._id || campaignId,
+          campaignTitle: normalizedCampaignDetails.campaignTitle,
+          brandId: normalizedCampaignDetails.brandId,
+        },
+      });
+    }
+
+    if (refreshLive) {
+      try {
+        refreshedCount = await refreshChannelsForCampaign({
+          ...normalizedCampaignDetails,
+          targetCountry: country,
+          minSubscribers,
+          maxSubscribers,
+          minAvgViews: campaignDetails.minAvgViews,
+          strictFilters: strictTier,
+          strictCountry: Boolean(country) && strictCountry,
+          targetSaveCount: Math.min(RAW_CHANNELS_PER_SEARCH, Math.max(limit * 3, TARGET_CHANNELS_PER_SEARCH)),
+        });
+      } catch (err) {
+        liveError = err?.message || 'YouTube live fetch failed. Showing cached recommendations.';
+        await saveErrorLog(req, err, err?.status || 429, 'YOUTUBE_CAMPAIGN_RECOMMEND_REFRESH');
+      }
+    }
+
+    const savedRows = await buildCampaignRecommendationRowsFromCache({
+      keyword,
+      category,
+      country,
+      minSubscribers,
+      maxSubscribers,
+      campaignDetails: normalizedCampaignDetails,
+      includeExcluded,
+      strictTier,
+      limit,
+      shouldSave,
+    });
+
+    const dtoRows = savedRows.map(campaignRecommendationDTO);
+    const channelNamePayload = buildRecommendationChannelNamePayload(dtoRows, minimumTarget);
+    const recommendationCountStatus = getRecommendationCountStatus(savedRows, limit, normalizedCampaignDetails, minSubscribers, maxSubscribers);
+
+    return res.status(200).json({
+      success: true,
+      source: 'youtube_api',
+      mode: refreshLive ? 'live' : 'cached',
+      processing: false,
+      campaignId,
+      brandId: normalizedCampaignDetails.brandId,
+      refreshedCount,
+      savedCount: savedRows.filter((row) => row.saved).length,
+      returnedCount: savedRows.length,
+      recommendationBasis: {
+        campaignTitle: normalizedCampaignDetails.campaignTitle,
+        descriptionUsed: Boolean(normalizedCampaignDetails.description),
+        budget: normalizedCampaignDetails.campaignBudget || 0,
+        paymentType: normalizedCampaignDetails.paymentType || '',
+        targetCountry: country,
+        subscriberTier: normalizedCampaignDetails.subscriberTier || '',
+        strictCountry,
+        strictTier,
+        minimumInfluencerTarget: minimumTarget,
+        keywords: normalizedCampaignDetails.keywords || [],
+      },
+      ...channelNamePayload,
+      ...recommendationCountStatus,
+      data: dtoRows,
+      rawCampaign: {
+        _id: rawCampaign?._id || campaignId,
+        campaignTitle: normalizedCampaignDetails.campaignTitle,
+        brandId: normalizedCampaignDetails.brandId,
+      },
+      ...(liveError ? { warning: liveError } : {}),
+    });
+  } catch (err) {
+    await saveErrorLog(req, err, err?.status || 500, 'YOUTUBE_CAMPAIGN_RECOMMENDATIONS');
+    return res.status(err?.status || 500).json({
+      success: false,
+      error: err?.message || 'Failed to recommend YouTube creators for campaign',
+    });
+  }
 }
 
 async function getCreatorMediaKit(req, res) {
@@ -1988,6 +3391,10 @@ async function proxyImage(req, res) {
       'yt3.googleusercontent.com',
       'i.ytimg.com',
       'img.youtube.com',
+      'lh3.googleusercontent.com',
+      'lh4.googleusercontent.com',
+      'lh5.googleusercontent.com',
+      'lh6.googleusercontent.com',
     ];
 
     if (parsed.protocol !== 'https:' || !allowedHosts.includes(parsed.hostname)) {
@@ -2025,6 +3432,7 @@ async function proxyImage(req, res) {
 
 module.exports = {
   browseCreators,
+  recommendCreatorsForCampaign,
   getCreatorMediaKit,
   proxyImage,
 };
