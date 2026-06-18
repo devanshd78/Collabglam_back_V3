@@ -69,6 +69,31 @@ const brandMemberRoutes = require("./routes/brandMemberRoutes");
 const app = express();
 const server = http.createServer(app);
 
+/* =========================================================
+   SERVER TIMEOUTS
+   Keeps long YouTube recommendation requests alive in production.
+   Default is 6 minutes so the frontend can show a 5-minute loader
+   with a small buffer. You can override these from .env.
+========================================================= */
+const SERVER_REQUEST_TIMEOUT_MS = Number(process.env.SERVER_REQUEST_TIMEOUT_MS || 360000);
+const SERVER_HEADERS_TIMEOUT_MS = Number(
+  process.env.SERVER_HEADERS_TIMEOUT_MS || SERVER_REQUEST_TIMEOUT_MS + 10000
+);
+const SERVER_SOCKET_TIMEOUT_MS = Number(
+  process.env.SERVER_SOCKET_TIMEOUT_MS || SERVER_REQUEST_TIMEOUT_MS
+);
+const SERVER_KEEP_ALIVE_TIMEOUT_MS = Number(
+  process.env.SERVER_KEEP_ALIVE_TIMEOUT_MS || 65000
+);
+const MONGODB_SOCKET_TIMEOUT_MS = Number(
+  process.env.MONGODB_SOCKET_TIMEOUT_MS || SERVER_REQUEST_TIMEOUT_MS
+);
+
+server.requestTimeout = SERVER_REQUEST_TIMEOUT_MS;
+server.headersTimeout = SERVER_HEADERS_TIMEOUT_MS;
+server.timeout = SERVER_SOCKET_TIMEOUT_MS;
+server.keepAliveTimeout = SERVER_KEEP_ALIVE_TIMEOUT_MS;
+
 const GridFSBucket = mongoose.mongo.GridFSBucket;
 const { Types } = mongoose;
 
@@ -93,7 +118,6 @@ const defaultCorsOrigins = [
   "http://192.168.1.24:3000",
   "https://mhd.sharemitra.com",
 ];
-
 
 /* =========================================================
    REALTIME SETUP
@@ -474,10 +498,13 @@ async function bootstrap() {
       maxPoolSize: 20,
       minPoolSize: 5,
       serverSelectionTimeoutMS: 10000,
-      socketTimeoutMS: 45000,
+      socketTimeoutMS: MONGODB_SOCKET_TIMEOUT_MS,
     });
 
     console.log("✅ Connected to MongoDB");
+    console.log(
+      `✅ Server timeouts set: request=${SERVER_REQUEST_TIMEOUT_MS}ms, socket=${SERVER_SOCKET_TIMEOUT_MS}ms, mongoSocket=${MONGODB_SOCKET_TIMEOUT_MS}ms`
+    );
 
     const bucket = getGridFsBucket();
     app.set("gridfsBucket", bucket);
