@@ -286,6 +286,18 @@ const milestoneHistorySchema = new Schema(
       trim: true,
       index: true,
     },
+    contractSource: {
+      type: String,
+      enum: ["", "template", "uploaded"],
+      default: "template",
+      trim: true,
+      index: true,
+    },
+    isUploadedContract: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
     adminId: {
       type: Schema.Types.ObjectId,
       ref: "Master",
@@ -294,14 +306,14 @@ const milestoneHistorySchema = new Schema(
     },
     createdByRole: {
       type: String,
-      enum: ["brand", "admin", ""],
+      enum: ["brand", "admin", "system", ""],
       default: "brand",
       trim: true,
       index: true,
     },
     createdByModel: {
       type: String,
-      enum: ["Brand", "Master", "Admin", ""],
+      enum: ["Brand", "Master", "Admin", "Contract", ""],
       default: "",
       trim: true,
     },
@@ -371,7 +383,28 @@ const milestoneHistorySchema = new Schema(
       default: "pending",
       index: true,
     },
+    submissionStatus: {
+      type: String,
+      enum: ["pending", "submitted"],
+      default: "pending",
+      index: true,
+    },
+    milestoneSubmissionStatus: {
+      type: String,
+      enum: ["pending", "submitted"],
+      default: "pending",
+      index: true,
+    },
+    isMilestoneSubmitted: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
     submittedAt: {
+      type: Date,
+      default: null,
+    },
+    milestoneSubmittedAt: {
       type: Date,
       default: null,
     },
@@ -431,11 +464,16 @@ milestoneSchema.index({
   "milestoneHistory.campaignId": 1,
 });
 milestoneSchema.index({ "milestoneHistory.contractId": 1 });
+milestoneSchema.index({ "milestoneHistory.contractSource": 1 });
+milestoneSchema.index({ "milestoneHistory.isUploadedContract": 1 });
 milestoneSchema.index({ "milestoneHistory.adminId": 1 });
 milestoneSchema.index({ "milestoneHistory.createdByRole": 1 });
 milestoneSchema.index({ "milestoneHistory.deliverables._id": 1 });
 milestoneSchema.index({ "milestoneHistory.isAccepted": 1 });
 milestoneSchema.index({ "milestoneHistory.status": 1 });
+milestoneSchema.index({ "milestoneHistory.submissionStatus": 1 });
+milestoneSchema.index({ "milestoneHistory.milestoneSubmissionStatus": 1 });
+milestoneSchema.index({ "milestoneHistory.isMilestoneSubmitted": 1 });
 milestoneSchema.index({ "milestoneHistory.payoutStatus": 1 });
 milestoneSchema.index({ "milestoneHistory.deliverables.status": 1 });
 milestoneSchema.index({ "milestoneHistory.deliverables.submittedByInfluencerId": 1 });
@@ -443,6 +481,7 @@ milestoneSchema.index({ "milestoneHistory.deliverables.revisions._id": 1 });
 milestoneSchema.index({
   "milestoneHistory.deliverables.revisions.deliverableId": 1,
 });
+milestoneSchema.index({ "milestoneHistory.deliverables.revisions.status": 1 });
 
 module.exports =
   mongoose.models.Milestone || mongoose.model("Milestone", milestoneSchema);

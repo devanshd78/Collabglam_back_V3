@@ -388,6 +388,61 @@ const isContractFullySignedForMilestone = async (contractDoc = {}) => {
   return signedRoles.has("brand") && signedRoles.has("influencer");
 };
 
+const getContractSourceType = (contractDoc = {}) => {
+  const rawSource = clean(
+    contractDoc?.contractSource ||
+      contractDoc?.documentSource ||
+      contractDoc?.document?.documentSource ||
+      contractDoc?.contractDocument?.documentSource ||
+      contractDoc?.document?.uploadedContract?.documentSource ||
+      contractDoc?.contractDocument?.uploadedContract?.documentSource ||
+      contractDoc?.uploadedContract?.documentSource ||
+      ""
+  ).toLowerCase();
+
+  const uploadedMarkers = [
+    contractDoc?.uploadedContract,
+    contractDoc?.documentUploadedContract,
+    contractDoc?.signedUploadedContract,
+    contractDoc?.document?.uploadedContract,
+    contractDoc?.document?.signedUploadedContract,
+    contractDoc?.contractDocument?.uploadedContract,
+    contractDoc?.contractDocument?.signedUploadedContract,
+  ];
+
+  const hasUploadedFile = uploadedMarkers.some((item) => {
+    if (!item) return false;
+    if (typeof item === "string") return Boolean(clean(item));
+    if (typeof item === "object") {
+      return Boolean(
+        clean(
+          item.key ||
+            item.url ||
+            item.originalName ||
+            item.fileName ||
+            item.name ||
+            item.path
+        )
+      );
+    }
+    return false;
+  });
+
+  if (
+    ["uploaded", "own", "brand_uploaded", "uploaded_contract"].includes(
+      rawSource
+    ) ||
+    hasUploadedFile
+  ) {
+    return "uploaded";
+  }
+
+  return "template";
+};
+
+const isUploadedContractSource = (contractDoc = {}) =>
+  getContractSourceType(contractDoc) === "uploaded";
+
 const normalizeAttachments = (input = []) => {
   return toArray(input)
     .map((item) => {
@@ -892,6 +947,7 @@ exports.createMilestone = async (req, res) => {
       let contractDoc = null;
       let influencerBudget = 0;
       let existingTotalForInfluencerContract = 0;
+      let isUploadedContractFlow = false;
 
       if (!isAdminMilestoneFinal) {
         const contractOr = [{ contractId: resolvedContractId }];
@@ -945,34 +1001,41 @@ exports.createMilestone = async (req, res) => {
           );
         }
 
-        const commercial = contractDoc?.content?.scheduleA?.commercial || {};
+        isUploadedContractFlow = isUploadedContractSource(contractDoc);
 
-        influencerBudget = getFirstPositiveNumber(
-          commercial?.totalCampaignFee,
-          commercial?.influencerBudget,
-          commercial?.feeAmount,
-          contractDoc?.totalCampaignFee,
-          contractDoc?.feeAmount,
-          contractDoc?.influencerBudget,
-          contractDoc?.amount
-        );
+        // Uploaded / own-contract flow does not have structured commercial terms,
+        // so do not require influencer budget from Schedule A. Template contracts
+        // keep the previous budget validation exactly as before.
+        if (!isUploadedContractFlow) {
+          const commercial = contractDoc?.content?.scheduleA?.commercial || {};
 
-        if (!influencerBudget) {
-          abort(
-            400,
-            "Influencer budget not found in contract. Please update the contract amount first."
+          influencerBudget = getFirstPositiveNumber(
+            commercial?.totalCampaignFee,
+            commercial?.influencerBudget,
+            commercial?.feeAmount,
+            contractDoc?.totalCampaignFee,
+            contractDoc?.feeAmount,
+            contractDoc?.influencerBudget,
+            contractDoc?.amount
           );
-        }
 
-        if (amountNum > influencerBudget) {
-          abort(
-            400,
-            "Milestone budget cannot exceed influencer contract budget.",
-            {
-              milestoneBudget: amountNum,
-              influencerBudget,
-            }
-          );
+          if (!influencerBudget) {
+            abort(
+              400,
+              "Influencer budget not found in contract. Please update the contract amount first."
+            );
+          }
+
+          if (amountNum > influencerBudget) {
+            abort(
+              400,
+              "Milestone budget cannot exceed influencer contract budget.",
+              {
+                milestoneBudget: amountNum,
+                influencerBudget,
+              }
+            );
+          }
         }
       }
 
@@ -1008,6 +1071,7 @@ exports.createMilestone = async (req, res) => {
 
       if (
         !isAdminMilestoneFinal &&
+        !isUploadedContractFlow &&
         existingTotalForInfluencerContract + amountNum > influencerBudget
       ) {
         abort(
@@ -1097,6 +1161,10 @@ exports.createMilestone = async (req, res) => {
         contractId: isAdminMilestoneFinal
           ? ""
           : contractDoc?.contractId || resolvedContractId,
+        contractSource: isAdminMilestoneFinal
+          ? ""
+          : getContractSourceType(contractDoc),
+        isUploadedContract: Boolean(!isAdminMilestoneFinal && isUploadedContractFlow),
 
         adminId: isAdminMilestoneFinal ? toObjectId(finalAdminId) : null,
         createdByRole: isAdminMilestoneFinal ? "admin" : "brand",
@@ -1214,16 +1282,19 @@ exports.createMilestone = async (req, res) => {
           ? String(createdEntry.adminId || finalAdminId)
           : "",
 
-        influencerBudget: isAdminMilestoneFinal ? null : influencerBudget,
-        usedInfluencerBudget: isAdminMilestoneFinal
-          ? null
-          : existingTotalForInfluencerContract + amountNum,
-        remainingInfluencerBudget: isAdminMilestoneFinal
-          ? null
-          : Math.max(
-              0,
-              influencerBudget - existingTotalForInfluencerContract - amountNum
-            ),
+        influencerBudget:
+          isAdminMilestoneFinal || isUploadedContractFlow ? null : influencerBudget,
+        usedInfluencerBudget:
+          isAdminMilestoneFinal || isUploadedContractFlow
+            ? null
+            : existingTotalForInfluencerContract + amountNum,
+        remainingInfluencerBudget:
+          isAdminMilestoneFinal || isUploadedContractFlow
+            ? null
+            : Math.max(
+                0,
+                influencerBudget - existingTotalForInfluencerContract - amountNum
+              ),
 
         entry: {
           milestoneHistoryId: String(createdEntry._id),
@@ -1231,6 +1302,8 @@ exports.createMilestone = async (req, res) => {
           campaignId: createdEntry.campaignId,
 
           contractId: createdEntry.contractId || "",
+          contractSource: createdEntry.contractSource || "",
+          isUploadedContract: Boolean(createdEntry.isUploadedContract),
           adminId: createdEntry.adminId ? String(createdEntry.adminId) : "",
           createdByRole: createdEntry.createdByRole || "",
           createdByModel: createdEntry.createdByModel || "",
@@ -1526,6 +1599,7 @@ exports.editMilestone = async (req, res) => {
       }
 
       let contractDoc = null;
+      let isUploadedContractFlow = false;
 
       if (contractOr.length) {
         contractDoc = await Contract.findOne({
@@ -1547,23 +1621,29 @@ exports.editMilestone = async (req, res) => {
         abort(400, "Contract not found for this milestone.");
       }
 
-      const commercial = contractDoc?.content?.scheduleA?.commercial || {};
+      isUploadedContractFlow = isUploadedContractSource(contractDoc);
 
-      const influencerBudget = getFirstPositiveNumber(
-        commercial?.totalCampaignFee,
-        commercial?.influencerBudget,
-        commercial?.feeAmount,
-        contractDoc?.totalCampaignFee,
-        contractDoc?.feeAmount,
-        contractDoc?.influencerBudget,
-        contractDoc?.amount
-      );
+      let influencerBudget = 0;
 
-      if (!influencerBudget) {
-        abort(
-          400,
-          "Influencer budget not found in contract. Please update the contract amount first."
+      if (!isUploadedContractFlow) {
+        const commercial = contractDoc?.content?.scheduleA?.commercial || {};
+
+        influencerBudget = getFirstPositiveNumber(
+          commercial?.totalCampaignFee,
+          commercial?.influencerBudget,
+          commercial?.feeAmount,
+          contractDoc?.totalCampaignFee,
+          contractDoc?.feeAmount,
+          contractDoc?.influencerBudget,
+          contractDoc?.amount
         );
+
+        if (!influencerBudget) {
+          abort(
+            400,
+            "Influencer budget not found in contract. Please update the contract amount first."
+          );
+        }
       }
 
       const existingTotalExcludingCurrent = (doc.milestoneHistory || [])
@@ -1579,7 +1659,7 @@ exports.editMilestone = async (req, res) => {
           0
         );
 
-      if (existingTotalExcludingCurrent + amountNum > influencerBudget) {
+      if (!isUploadedContractFlow && existingTotalExcludingCurrent + amountNum > influencerBudget) {
         abort(
           400,
           "Total milestone budget cannot exceed influencer contract budget.",
@@ -1664,6 +1744,8 @@ exports.editMilestone = async (req, res) => {
       entry.graceDays =
         Number.isFinite(graceDaysNum) && graceDaysNum > 0 ? graceDaysNum : 0;
       entry.submissionLink = clean(submissionLink);
+      entry.contractSource = getContractSourceType(contractDoc);
+      entry.isUploadedContract = Boolean(isUploadedContractFlow);
       entry.needDraftFirst = needsDraft;
       entry.draftDate = needsDraft ? parsedDraftDate : null;
 
@@ -1678,6 +1760,8 @@ exports.editMilestone = async (req, res) => {
           influencerId: entry.influencerId,
           campaignId: entry.campaignId,
           contractId: entry.contractId,
+          contractSource: entry.contractSource || "",
+          isUploadedContract: Boolean(entry.isUploadedContract),
 
           milestoneTitle: entry.milestoneTitle,
           milestoneDescription: entry.milestoneDescription,
@@ -2219,29 +2303,19 @@ exports.releaseMilestone = async (req, res) => {
       return res.status(400).json({ message: "This milestone has already been released." });
     }
 
-    const milestoneSubmissionStatus = String(
-      entry.submissionStatus ||
-        entry.milestoneSubmissionStatus ||
-        entry.status ||
-        ""
-    )
-      .trim()
-      .toLowerCase();
-
-    const milestoneSubmittedByInfluencer = Boolean(
-      entry.isMilestoneSubmitted === true ||
-        entry.submittedAt ||
-        entry.milestoneSubmittedAt ||
-        entry.submittedByInfluencerId ||
-        milestoneSubmissionStatus === "submitted" ||
-        milestoneSubmissionStatus === "milestone_submitted" ||
-        milestoneSubmissionStatus === "ready_for_brand_review"
-    );
+    const milestoneSubmittedByInfluencer = hasMilestoneBeenSubmittedByInfluencer(entry);
 
     if (!milestoneSubmittedByInfluencer) {
       return res.status(400).json({
         message:
           "Influencer must submit the milestone before payment can be released.",
+      });
+    }
+
+    if (!areAllDeliverablesApprovedForRelease(entry)) {
+      return res.status(400).json({
+        message:
+          "All deliverables and revisions must be approved before payment can be released.",
       });
     }
 
@@ -2328,23 +2402,7 @@ exports.releaseMilestone = async (req, res) => {
       message: "Milestone released successfully (payout initiated).",
       releasedAmount: entry.amount,
       payoutStatus: entry.payoutStatus,
-      milestone: {
-        milestoneId: String(doc._id),
-        milestoneHistoryId: String(entry._id),
-        milestoneTitle: entry.milestoneTitle || "",
-        milestoneDescription: entry.milestoneDescription || "",
-        amount: Number(entry.amount || entry.milestoneBudget || 0),
-        milestoneBudget: Number(entry.milestoneBudget || entry.amount || 0),
-        status: entry.status || "submitted",
-        submissionStatus: entry.submissionStatus || "submitted",
-        isMilestoneSubmitted: Boolean(entry.isMilestoneSubmitted),
-        submittedAt: entry.submittedAt || null,
-        milestoneSubmittedAt: entry.milestoneSubmittedAt || null,
-        submittedByInfluencerId: entry.submittedByInfluencerId || "",
-        released: entry.released,
-        releasedAt: entry.releasedAt,
-        payoutStatus: entry.payoutStatus,
-      },
+      milestone: mapMilestoneHistoryForResponse(doc, entry),
       wallet: {
         walletBalance: walletSnap.walletBalance,
         escrowBalance: walletSnap.escrowBalance,
@@ -2798,13 +2856,44 @@ exports.getPayoutDetailsByInfluencer = async (req, res) => {
 
 
 
+const normalizeObjectIdString = (value) => {
+  if (!value) return "";
+  if (typeof value === "string") return value;
+  if (typeof value?.toHexString === "function") return value.toHexString();
+  if (value?._id) return normalizeObjectIdString(value._id);
+  return String(value || "");
+};
+
 const isDeliverableSubmittedForMilestone = (deliverable) => {
-  const status = String(deliverable?.status || "").toLowerCase();
+  const status = String(deliverable?.status || "").trim().toLowerCase();
+
+  if (["revision", "pending", "draft_submitted"].includes(status)) {
+    return false;
+  }
+
   const links = Array.isArray(deliverable?.deliverableLinks)
     ? deliverable.deliverableLinks.filter((item) => clean(item?.url)).length
     : 0;
 
-  return links > 0 || ["submitted", "approved", "completed", "complete", "paid"].some((item) => status.includes(item));
+  return (
+    ["submitted", "approved", "completed", "complete", "paid"].some((item) =>
+      status.includes(item)
+    ) && links > 0
+  );
+};
+
+const isDeliverableApprovedForRelease = (deliverable) => {
+  const status = String(deliverable?.status || "").trim().toLowerCase();
+  if (status !== "approved") return false;
+
+  const revisions = Array.isArray(deliverable?.revisions)
+    ? deliverable.revisions
+    : [];
+
+  return revisions.every((revision) => {
+    const revisionStatus = String(revision?.status || "").trim().toLowerCase();
+    return revisionStatus === "approved" || revisionStatus === "";
+  });
 };
 
 const canSubmitMilestoneHistory = (milestoneHistory = {}) => {
@@ -2814,6 +2903,92 @@ const canSubmitMilestoneHistory = (milestoneHistory = {}) => {
 
   return deliverables.length > 0 && deliverables.every(isDeliverableSubmittedForMilestone);
 };
+
+const areAllDeliverablesApprovedForRelease = (milestoneHistory = {}) => {
+  const deliverables = Array.isArray(milestoneHistory.deliverables)
+    ? milestoneHistory.deliverables
+    : [];
+
+  return deliverables.length > 0 && deliverables.every(isDeliverableApprovedForRelease);
+};
+
+const hasMilestoneBeenSubmittedByInfluencer = (milestoneHistory = {}) => {
+  const submissionStatus = String(
+    milestoneHistory?.submissionStatus || milestoneHistory?.milestoneSubmissionStatus || ""
+  )
+    .trim()
+    .toLowerCase();
+
+  const status = String(milestoneHistory?.status || "").trim().toLowerCase();
+
+  return Boolean(
+    milestoneHistory?.isMilestoneSubmitted === true ||
+      submissionStatus === "submitted" ||
+      submissionStatus === "milestone_submitted" ||
+      status === "submitted" ||
+      milestoneHistory?.milestoneSubmittedAt ||
+      milestoneHistory?.submittedAt ||
+      clean(milestoneHistory?.submittedByInfluencerId)
+  );
+};
+
+const resetMilestoneSubmissionAfterRevision = (milestoneHistory = {}) => {
+  milestoneHistory.status = "revision";
+  milestoneHistory.submissionStatus = "pending";
+  milestoneHistory.milestoneSubmissionStatus = "pending";
+  milestoneHistory.isMilestoneSubmitted = false;
+  milestoneHistory.submittedAt = null;
+  milestoneHistory.milestoneSubmittedAt = null;
+  milestoneHistory.submittedByInfluencerId = "";
+};
+
+const markMilestoneReadyForBrandReview = (milestoneHistory = {}) => {
+  if (hasMilestoneBeenSubmittedByInfluencer(milestoneHistory)) return;
+
+  milestoneHistory.status = "ready_for_brand_review";
+  milestoneHistory.submissionStatus = "pending";
+  milestoneHistory.milestoneSubmissionStatus = "pending";
+  milestoneHistory.isMilestoneSubmitted = false;
+  milestoneHistory.submittedAt = null;
+  milestoneHistory.milestoneSubmittedAt = null;
+  milestoneHistory.submittedByInfluencerId = "";
+};
+
+const syncMilestoneStatusAfterApproval = (milestoneHistory = {}) => {
+  const allApproved = areAllDeliverablesApprovedForRelease(milestoneHistory);
+
+  if (allApproved && hasMilestoneBeenSubmittedByInfluencer(milestoneHistory)) {
+    milestoneHistory.status = "approved";
+    return;
+  }
+
+  if (canSubmitMilestoneHistory(milestoneHistory) && !hasMilestoneBeenSubmittedByInfluencer(milestoneHistory)) {
+    milestoneHistory.status = "ready_for_brand_review";
+  }
+};
+
+const mapRevisionForResponse = (revision, fallbackDeliverableId = "") => ({
+  revisionId: String(revision?._id || ""),
+  deliverableId: String(revision?.deliverableId || fallbackDeliverableId || ""),
+  issueName: revision?.issueName || "",
+  revisionType: revision?.revisionType || "free",
+  revisionBudget: Number(revision?.revisionBudget || 0),
+  deliveryName: revision?.deliveryName || "",
+  issueDeliverableLink: revision?.issueDeliverableLink || "",
+  notes: revision?.notes || "",
+  attachments: revision?.attachments || [],
+  submissionDate: revision?.submissionDate || null,
+  status: revision?.status || "pending",
+  submittedAt: revision?.submittedAt || null,
+  approvedAt: revision?.approvedAt || null,
+  approvedRole: revision?.approvedRole || "",
+  approvalId: revision?.approvalId || "",
+  comments: revision?.comments || "",
+  raisedByRole: revision?.raisedByRole || "Brand",
+  raisedAt: revision?.raisedAt || null,
+  createdAt: revision?.createdAt || null,
+  updatedAt: revision?.updatedAt || null,
+});
 
 const mapDeliverableForResponse = (item, milestoneDoc, milestoneHistory) => ({
   deliverableId: String(item._id),
@@ -2831,6 +3006,10 @@ const mapDeliverableForResponse = (item, milestoneDoc, milestoneHistory) => ({
   amount: Number(milestoneHistory.amount || milestoneHistory.milestoneBudget || 0),
   milestoneStatus: milestoneHistory.status || milestoneHistory.payoutStatus || "pending",
   canSubmitMilestone: canSubmitMilestoneHistory(milestoneHistory),
+  canReleaseMilestone:
+    hasMilestoneBeenSubmittedByInfluencer(milestoneHistory) &&
+    areAllDeliverablesApprovedForRelease(milestoneHistory),
+  isMilestoneSubmitted: hasMilestoneBeenSubmittedByInfluencer(milestoneHistory),
 
   deliverableName: item.deliverableName || "",
   title: item.deliverableName || "",
@@ -2894,29 +3073,66 @@ const mapDeliverableForResponse = (item, milestoneDoc, milestoneHistory) => ({
   revisionRequestedAt: item.revisionRequestedAt || null,
 
   revisions: Array.isArray(item.revisions)
-    ? item.revisions.map((revision) => ({
-        revisionId: String(revision._id),
-        deliverableId: String(revision.deliverableId || item._id),
-        issueName: revision.issueName || "",
-        revisionType: revision.revisionType || "free",
-        revisionBudget: Number(revision.revisionBudget || 0),
-        deliveryName: revision.deliveryName || "",
-        issueDeliverableLink: revision.issueDeliverableLink || "",
-        notes: revision.notes || "",
-        attachments: revision.attachments || [],
-        submissionDate: revision.submissionDate || null,
-        status: revision.status || "pending",
-        submittedAt: revision.submittedAt || null,
-        approvedAt: revision.approvedAt || null,
-        raisedByRole: revision.raisedByRole || "Brand",
-        raisedAt: revision.raisedAt || null,
-        createdAt: revision.createdAt || null,
-        updatedAt: revision.updatedAt || null,
-      }))
+    ? item.revisions.map((revision) => mapRevisionForResponse(revision, item._id))
     : [],
 
   createdAt: item.createdAt || null,
   updatedAt: item.updatedAt || null,
+});
+
+const mapMilestoneHistoryForResponse = (milestoneDoc, milestoneHistory) => ({
+  milestoneId: String(milestoneDoc._id),
+  milestoneHistoryId: String(milestoneHistory._id),
+  brandId: String(milestoneDoc.brandId || ""),
+  influencerId: String(milestoneHistory.influencerId || ""),
+  campaignId: String(milestoneHistory.campaignId || ""),
+  contractId: milestoneHistory.contractId || "",
+  contractMongoId: milestoneHistory.contractMongoId || null,
+  adminId: milestoneHistory.adminId ? String(milestoneHistory.adminId) : "",
+  createdByRole: milestoneHistory.createdByRole || "",
+  createdByModel: milestoneHistory.createdByModel || "",
+  milestoneTitle: milestoneHistory.milestoneTitle || "",
+  milestoneName: milestoneHistory.milestoneTitle || "",
+  title: milestoneHistory.milestoneTitle || "",
+  name: milestoneHistory.milestoneTitle || "",
+  milestoneDescription: milestoneHistory.milestoneDescription || "",
+  description: milestoneHistory.milestoneDescription || "",
+  milestoneBudget: Number(milestoneHistory.milestoneBudget || milestoneHistory.amount || 0),
+  amount: Number(milestoneHistory.amount || milestoneHistory.milestoneBudget || 0),
+  budget: Number(milestoneHistory.milestoneBudget || milestoneHistory.amount || 0),
+  attachments: milestoneHistory.attachments || [],
+  deliverables: Array.isArray(milestoneHistory.deliverables)
+    ? milestoneHistory.deliverables.map((item) => mapDeliverableForResponse(item, milestoneDoc, milestoneHistory))
+    : [],
+  deliverablesCount: Array.isArray(milestoneHistory.deliverables)
+    ? milestoneHistory.deliverables.length
+    : 0,
+  startDate: milestoneHistory.startDate || null,
+  endDate: milestoneHistory.endDate || null,
+  dueDate: milestoneHistory.endDate || null,
+  deadline: milestoneHistory.endDate || null,
+  graceDays: Number(milestoneHistory.graceDays || 0),
+  submissionLink: milestoneHistory.submissionLink || "",
+  needDraftFirst: Boolean(milestoneHistory.needDraftFirst),
+  draftDate: milestoneHistory.draftDate || null,
+  isAccepted: milestoneHistory.isAccepted || 0,
+  status: milestoneHistory.status || "pending",
+  submissionStatus: milestoneHistory.submissionStatus || "pending",
+  milestoneSubmissionStatus: milestoneHistory.milestoneSubmissionStatus || "pending",
+  isMilestoneSubmitted: hasMilestoneBeenSubmittedByInfluencer(milestoneHistory),
+  submittedAt: milestoneHistory.submittedAt || null,
+  milestoneSubmittedAt: milestoneHistory.milestoneSubmittedAt || null,
+  submittedByInfluencerId: milestoneHistory.submittedByInfluencerId || "",
+  canSubmitMilestone: canSubmitMilestoneHistory(milestoneHistory),
+  canReleaseMilestone:
+    hasMilestoneBeenSubmittedByInfluencer(milestoneHistory) &&
+    areAllDeliverablesApprovedForRelease(milestoneHistory),
+  released: Boolean(milestoneHistory.released),
+  releasedAt: milestoneHistory.releasedAt || null,
+  payoutStatus: milestoneHistory.payoutStatus || "pending",
+  paidAt: milestoneHistory.paidAt || null,
+  createdAt: milestoneHistory.createdAt || null,
+  updatedAt: milestoneHistory.updatedAt || null,
 });
 
 // ======================================================================
@@ -3140,6 +3356,7 @@ exports.addRevision = async (req, res) => {
       }
 
       let contractDoc = null;
+      let isUploadedContractFlow = false;
 
       if (contractOr.length > 0) {
         contractDoc = await Contract.findOne({
@@ -3161,23 +3378,29 @@ exports.addRevision = async (req, res) => {
         abort(400, "Contract not found for this milestone");
       }
 
-      const commercial = contractDoc?.content?.scheduleA?.commercial || {};
+      isUploadedContractFlow = isUploadedContractSource(contractDoc);
 
-      const influencerBudget = getFirstPositiveNumber(
-        commercial?.totalCampaignFee,
-        commercial?.influencerBudget,
-        commercial?.feeAmount,
-        contractDoc?.totalCampaignFee,
-        contractDoc?.feeAmount,
-        contractDoc?.influencerBudget,
-        contractDoc?.amount
-      );
+      let influencerBudget = 0;
 
-      if (!influencerBudget) {
-        abort(
-          400,
-          "Influencer budget not found in contract. Please update the contract amount first."
+      if (!isUploadedContractFlow) {
+        const commercial = contractDoc?.content?.scheduleA?.commercial || {};
+
+        influencerBudget = getFirstPositiveNumber(
+          commercial?.totalCampaignFee,
+          commercial?.influencerBudget,
+          commercial?.feeAmount,
+          contractDoc?.totalCampaignFee,
+          contractDoc?.feeAmount,
+          contractDoc?.influencerBudget,
+          contractDoc?.amount
         );
+
+        if (!influencerBudget) {
+          abort(
+            400,
+            "Influencer budget not found in contract. Please update the contract amount first."
+          );
+        }
       }
 
       const currentMilestoneBudget = Number(
@@ -3196,12 +3419,12 @@ exports.addRevision = async (req, res) => {
           0
         );
 
-      const remainingInfluencerBudgetBefore = Math.max(
-        0,
-        influencerBudget - usedMilestoneBudgetBefore
-      );
+      const remainingInfluencerBudgetBefore = isUploadedContractFlow
+        ? null
+        : Math.max(0, influencerBudget - usedMilestoneBudgetBefore);
 
       if (
+        !isUploadedContractFlow &&
         normalizedRevisionType === "paid" &&
         revisionBudgetNum > remainingInfluencerBudgetBefore
       ) {
@@ -3216,6 +3439,11 @@ exports.addRevision = async (req, res) => {
           }
         );
       }
+
+      milestoneHistory.contractSource = milestoneHistory.contractSource || getContractSourceType(contractDoc);
+      milestoneHistory.isUploadedContract = Boolean(
+        milestoneHistory.isUploadedContract || isUploadedContractFlow
+      );
 
       if (normalizedRevisionType === "paid") {
         const wallet = await getOrCreateBrandWallet(
@@ -3306,6 +3534,8 @@ exports.addRevision = async (req, res) => {
       deliverable.status = "revision";
       deliverable.revisionRequestedAt = new Date();
       deliverable.comments = clean(notes) || deliverable.comments || "";
+      resetMilestoneSubmissionAfterRevision(milestoneHistory);
+      milestoneDoc.markModified("milestoneHistory");
 
       await milestoneDoc.save({ session });
 
@@ -3353,15 +3583,10 @@ exports.addRevision = async (req, res) => {
           updatedAt: createdRevision.updatedAt,
         },
 
-        deliverable: {
-          deliverableId: String(deliverable._id),
-          deliverableName: deliverable.deliverableName,
-          status: deliverable.status,
-          revisionRequestedAt: deliverable.revisionRequestedAt,
-          comments: deliverable.comments,
-        },
+        deliverable: mapDeliverableForResponse(deliverable, milestoneDoc, milestoneHistory),
 
         milestone: {
+          ...mapMilestoneHistoryForResponse(milestoneDoc, milestoneHistory),
           milestoneBudget: updatedMilestoneBudget,
           amount: updatedMilestoneBudget,
           addedRevisionBudget:
@@ -3372,11 +3597,13 @@ exports.addRevision = async (req, res) => {
           influencerBudget,
           usedMilestoneBudgetBefore,
           usedMilestoneBudgetAfter,
-          remainingBudget:
-            normalizedRevisionType === "paid"
+          remainingBudget: isUploadedContractFlow
+            ? null
+            : normalizedRevisionType === "paid"
               ? Math.max(0, influencerBudget - usedMilestoneBudgetAfter)
               : remainingInfluencerBudgetBefore,
           requestedRevisionBudget: revisionBudgetNum,
+          contractSource: getContractSourceType(contractDoc),
         },
 
         wallet: walletPayload?.wallet || null,
@@ -3535,6 +3762,7 @@ exports.submitDeliverable = async (req, res) => {
         milestoneId: String(milestoneDoc._id),
         milestoneHistoryId: String(milestoneHistory._id),
         deliverableId: String(deliverable._id),
+        milestone: mapMilestoneHistoryForResponse(milestoneDoc, milestoneHistory),
         deliverable: mapDeliverableForResponse(deliverable, milestoneDoc, milestoneHistory),
       });
     }
@@ -3581,10 +3809,11 @@ exports.submitDeliverable = async (req, res) => {
     deliverable.submittedByInfluencerId = String(influencerId);
 
     const allSubmitted = canSubmitMilestoneHistory(milestoneHistory);
-    if (allSubmitted && !milestoneHistory.submittedAt) {
-      milestoneHistory.status = "ready_for_brand_review";
+    if (allSubmitted && !hasMilestoneBeenSubmittedByInfluencer(milestoneHistory)) {
+      markMilestoneReadyForBrandReview(milestoneHistory);
     }
 
+    milestoneDoc.markModified("milestoneHistory");
     await milestoneDoc.save();
 
     return res.status(200).json({
@@ -3597,6 +3826,7 @@ exports.submitDeliverable = async (req, res) => {
       deliverableId: String(deliverable._id),
       revisionId: updatedRevision?._id ? String(updatedRevision._id) : "",
       canSubmitMilestone: canSubmitMilestoneHistory(milestoneHistory),
+      milestone: mapMilestoneHistoryForResponse(milestoneDoc, milestoneHistory),
       deliverable: mapDeliverableForResponse(deliverable, milestoneDoc, milestoneHistory),
     });
   } catch (err) {
@@ -3716,11 +3946,11 @@ exports.approveDeliverable = async (req, res) => {
 
     const submittedRevision = Array.isArray(deliverable.revisions)
       ? [...deliverable.revisions]
-        .reverse()
-        .find(
-          (revision) =>
-            String(revision.status || "").toLowerCase() === "submitted"
-        )
+          .reverse()
+          .find(
+            (revision) =>
+              String(revision.status || "").toLowerCase() === "submitted"
+          )
       : null;
 
     if (submittedRevision) {
@@ -3731,70 +3961,31 @@ exports.approveDeliverable = async (req, res) => {
       submittedRevision.comments = comments || submittedRevision.comments || "";
     }
 
+    syncMilestoneStatusAfterApproval(milestoneHistory);
+    milestoneDoc.markModified("milestoneHistory");
     await milestoneDoc.save();
 
     return res.status(200).json({
       success: true,
-      message: "Deliverable approved successfully",
+      message: submittedRevision
+        ? "Revision deliverable approved successfully"
+        : "Deliverable approved successfully",
       milestoneId: String(milestoneDoc._id),
       milestoneHistoryId: String(milestoneHistory._id),
       deliverableId: String(deliverable._id),
-      deliverable: {
-        deliverableId: String(deliverable._id),
-        deliverableName: deliverable.deliverableName,
-        deliveries: deliverable.deliveries || [],
-        aspectRatio: deliverable.aspectRatio || "",
-        platforms: deliverable.platforms || [],
-        quantity: deliverable.quantity || 1,
-        deliverableLinks: (deliverable.deliverableLinks || []).map((item) => ({
-          linkId: String(item._id),
-          label: item.label || "",
-          url: item.url || "",
-        })),
-        status: deliverable.status,
-        submittedAt: deliverable.submittedAt || null,
-        comments: deliverable.comments || "",
-        approvedRole: deliverable.approvedRole || "",
-        approvalId: deliverable.approvalId || "",
-        approvedAt: deliverable.approvedAt || null,
-        revisionRequestedAt: deliverable.revisionRequestedAt || null,
-        revisions: (deliverable.revisions || []).map((revision) => ({
-          revisionId: String(revision._id),
-          deliverableId: String(revision.deliverableId || deliverable._id),
-          issueName: revision.issueName || "",
-          revisionType: revision.revisionType || "free",
-          revisionBudget: Number(revision.revisionBudget || 0),
-          deliveryName: revision.deliveryName || "",
-          issueDeliverableLink: revision.issueDeliverableLink || "",
-          notes: revision.notes || "",
-          attachments: revision.attachments || [],
-          submissionDate: revision.submissionDate || null,
-          status: revision.status || "pending",
-          submittedAt: revision.submittedAt || null,
-          approvedAt: revision.approvedAt || null,
-          approvedRole: revision.approvedRole || "",
-          approvalId: revision.approvalId || "",
-          comments: revision.comments || "",
-          raisedByRole: revision.raisedByRole || "Brand",
-          raisedAt: revision.raisedAt || null,
-          createdAt: revision.createdAt || null,
-          updatedAt: revision.updatedAt || null,
-        })),
-        updatedAt: deliverable.updatedAt,
-      },
+      milestone: mapMilestoneHistoryForResponse(milestoneDoc, milestoneHistory),
+      deliverable: mapDeliverableForResponse(deliverable, milestoneDoc, milestoneHistory),
     });
   } catch (err) {
     console.error("Error in approveDeliverable:", err);
 
-    
-    await saveErrorLog(req, err, err?.statusCode || err?.status || err?.statusCode || 500, "APPROVE_DELIVERABLE_ERROR");return res.status(500).json({
+    await saveErrorLog(req, err, err?.statusCode || err?.status || err?.statusCode || 500, "APPROVE_DELIVERABLE_ERROR");
+    return res.status(500).json({
       success: false,
       message: "Internal server error",
     });
   }
 };
-
-
 
 exports.acceptMilestoneByInfluencer = async (req, res) => {
   try {
@@ -3998,7 +4189,6 @@ exports.updateDeliverableStatus = async (req, res) => {
     targetDeliverable.comments = String(comments || "").trim();
     targetDeliverable.revisionRequestedAt = new Date();
 
-    // If the submitted item belongs to latest revision, keep revision status synced too.
     const revisions = Array.isArray(targetDeliverable.revisions)
       ? targetDeliverable.revisions
       : [];
@@ -4012,6 +4202,8 @@ exports.updateDeliverableStatus = async (req, res) => {
       latestSubmittedRevision.updatedAt = new Date();
     }
 
+    resetMilestoneSubmissionAfterRevision(targetHistory);
+    milestoneDoc.markModified("milestoneHistory");
     await milestoneDoc.save();
 
     return res.status(200).json({
@@ -4026,12 +4218,14 @@ exports.updateDeliverableStatus = async (req, res) => {
         revisionRequestedAt: targetDeliverable.revisionRequestedAt,
         updatedAt: targetDeliverable.updatedAt,
       },
+      milestone: mapMilestoneHistoryForResponse(milestoneDoc, targetHistory),
+      deliverable: mapDeliverableForResponse(targetDeliverable, milestoneDoc, targetHistory),
     });
   } catch (err) {
     console.error("Error in updateDeliverableStatus:", err);
 
-    
-    await saveErrorLog(req, err, err?.statusCode || err?.status || err?.statusCode || 500, "UPDATE_DELIVERABLE_STATUS_ERROR");return res.status(500).json({
+    await saveErrorLog(req, err, err?.statusCode || err?.status || err?.statusCode || 500, "UPDATE_DELIVERABLE_STATUS_ERROR");
+    return res.status(500).json({
       success: false,
       message: "Internal server error",
     });

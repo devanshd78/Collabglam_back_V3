@@ -418,7 +418,11 @@ function sanitizeContractForClient(input) {
       _id: document._id || "",
       documentSource: document.documentSource || contract.documentSource || "",
       uploadedContract,
+      brandUploadedContract: document.brandUploadedContract || null,
+      signedUploadedContract: document.signedUploadedContract || null,
       finalContract: document.finalContract || null,
+      frozenAt: document.frozenAt || null,
+      frozenByRole: document.frozenByRole || "",
       createdAt: document.createdAt || null,
       updatedAt: document.updatedAt || null,
     }),
@@ -446,6 +450,226 @@ function sanitizeContractForClient(input) {
       },
     }),
   };
+
+}
+
+function isUploadedOwnContractDocument(contract = {}, document = {}) {
+  const source = String(
+    contract.contractSource ||
+      contract.documentSource ||
+      document.documentSource ||
+      contract.document?.documentSource ||
+      ""
+  ).toLowerCase();
+
+  return (
+    source === "uploaded" ||
+    Boolean(document?.uploadedContract?.key) ||
+    Boolean(document?.brandUploadedContract?.key) ||
+    Boolean(document?.signedUploadedContract?.key)
+  );
+}
+
+function hasInfluencerUploadedSignedOwnContract(document = {}) {
+  return Boolean(
+    document?.signedUploadedContract?.key ||
+      document?.finalContract?.key ||
+      (String(document?.frozenByRole || "").toLowerCase() === "influencer" &&
+        Boolean(document?.uploadedContract?.key))
+  );
+}
+
+function canBrandReplaceUploadedOwnContract(contract = null, document = {}) {
+  if (!contract) return false;
+  if (!isUploadedOwnContractDocument(contract, document)) return false;
+  if (isLockedContract(contract)) return false;
+  if (hasInfluencerUploadedSignedOwnContract(document)) return false;
+  return true;
+}
+
+async function findLatestUploadedOwnContractForPair({
+  brandId,
+  influencerId,
+  campaignId,
+  contractId = "",
+} = {}) {
+  const explicitId = String(contractId || "").trim();
+
+  if (explicitId) {
+    const contract = await findContract(explicitId);
+    if (!contract) return null;
+
+    const document = await ContractDocument.findOne({
+      contractId: contract.contractId,
+    }).lean();
+
+    if (!isUploadedOwnContractDocument(contract, document || {})) return null;
+
+    return { contract, document: document || null };
+  }
+
+  const candidates = await Contract.find({
+    brandId: String(brandId),
+    influencerId: String(influencerId),
+    campaignId: String(campaignId),
+    status: { $ne: CONTRACT_STATUS.SUPERSEDED },
+  })
+    .sort({ updatedAt: -1, createdAt: -1 })
+    .limit(10);
+
+  for (const contract of candidates) {
+    const document = await ContractDocument.findOne({
+      contractId: contract.contractId,
+    }).lean();
+
+    if (isUploadedOwnContractDocument(contract, document || {})) {
+      return { contract, document: document || null };
+    }
+  }
+
+  return null;
+}
+
+function buildUploadedOwnContractFileSnapshot({ uploadedContract, uploadedBy }) {
+  return {
+    originalName: uploadedContract.originalName,
+    bucket: CONTRACT_BUCKET,
+    folder: CONTRACT_FOLDER,
+    key: uploadedContract.key,
+    mimeType: "application/pdf",
+    sizeBytes: Number(uploadedContract.sizeBytes || 0),
+    uploadedBy: uploadedBy || "",
+    uploadedAt: new Date(),
+  };
+}
+
+async function replaceUploadedOwnContractFile({
+  req,
+  contract,
+  existingDocument,
+  uploadedContract,
+  brandId,
+  influencerId,
+  campaignId,
+  requestedEffectiveDate,
+  requestedEffectiveDateTimezone,
+}) {
+  if (!canBrandReplaceUploadedOwnContract(contract, existingDocument || {})) {
+    const e = new Error(
+      "Brand can replace an uploaded contract only before the creator uploads the signed PDF and before the contract is signed."
+    );
+    e.status = 400;
+    throw e;
+  }
+
+  const previousUploadKey =
+    existingDocument?.uploadedContract?.key ||
+    existingDocument?.brandUploadedContract?.key ||
+    "";
+
+  const uploadedBy =
+    req.user?.id || req.user?._id || req.user?.email || String(brandId);
+
+  const nextBrandUpload = buildUploadedOwnContractFileSnapshot({
+    uploadedContract,
+    uploadedBy,
+  });
+
+  await ContractDocument.findOneAndUpdate(
+    { contractId: contract.contractId },
+    {
+      $set: {
+        documentSource: "uploaded",
+        pdfUrl: "",
+        uploadedContract: nextBrandUpload,
+        brandUploadedContract: nextBrandUpload,
+        acknowledgement: {
+          version: 1,
+          title: "CollabGlam Uploaded Contract Acknowledgement",
+          text: UPLOADED_CONTRACT_ACKNOWLEDGEMENT,
+          appliesToUploadedContract: true,
+        },
+      },
+      $unset: {
+        signedUploadedContract: "",
+        frozenAt: "",
+        frozenByRole: "",
+        finalContract: "",
+      },
+    },
+    { upsert: true, new: true }
+  );
+
+  if (previousUploadKey && previousUploadKey !== uploadedContract.key) {
+    await deleteContractFile(previousUploadKey).catch(() => null);
+  }
+
+  contract.contractSource = "uploaded";
+  contract.status = CONTRACT_STATUS.BRAND_SENT_DRAFT;
+  contract.awaitingRole = "influencer";
+  contract.lastSentAt = new Date();
+  contract.isAccepted = 0;
+  contract.isRejected = 0;
+  contract.lockedAt = null;
+  contract.editsLockedAt = null;
+  contract.supersededBy = null;
+  contract.version = Number(contract.version || 0) + 1;
+  contract.statusFlags = contract.statusFlags || {};
+  contract.statusFlags.awaitingCollabglam = false;
+  contract.statusFlags.isRejected = false;
+  contract.statusFlags.isSuperseded = false;
+  contract.acceptances = contract.acceptances || {};
+  contract.acceptances.brand = {
+    ...(contract.acceptances.brand || {}),
+    accepted: false,
+  };
+  contract.acceptances.influencer = {
+    ...(contract.acceptances.influencer || {}),
+    accepted: false,
+  };
+
+  if (requestedEffectiveDate) {
+    contract.requestedEffectiveDate = buildRequestedEffectiveDate(
+      requestedEffectiveDate,
+      requestedEffectiveDateTimezone || contract.requestedEffectiveDateTimezone || DEFAULT_TZ
+    );
+  }
+
+  if (requestedEffectiveDateTimezone) {
+    contract.requestedEffectiveDateTimezone = requestedEffectiveDateTimezone;
+  }
+
+  await resetSignaturesForNewVersion(contract).catch(() => null);
+
+  await addActivity(contract, "brand", "REPLACED_UPLOADED_OWN_CONTRACT", {
+    bucket: CONTRACT_BUCKET,
+    folder: CONTRACT_FOLDER,
+    key: uploadedContract.key,
+    previousKey: previousUploadKey || "",
+    originalName: uploadedContract.originalName,
+    sizeBytes: uploadedContract.sizeBytes,
+    mimeType: uploadedContract.mimeType,
+    acknowledgementVersion: 1,
+  });
+
+  await contract.save();
+
+  await syncApplyCampaignAfterSend(contract, true);
+  await syncApplyCampaignAfterSend(contract, false);
+
+  await Campaign.updateOne(campaignQuery(campaignId), {
+    $set: {
+      isContracted: 1,
+      contractId: contract.contractId,
+      isAccepted: 0,
+      contractStatus: contract.status,
+    },
+  });
+
+  await safeStartReminder(contract, "influencer");
+  await safeClearReminder(contract.contractId, "brand");
+
+  return contract;
 }
 
 function assertRequired(obj, fields) {
@@ -4294,6 +4518,27 @@ exports.getOwnContractUploadUrl = async (req, res) => {
     if (!brandDoc) return respondError(res, "Brand not found", 404);
     if (!influencerDoc) return respondError(res, "Influencer not found", 404);
 
+    const existingUploaded = await findLatestUploadedOwnContractForPair({
+      brandId,
+      influencerId,
+      campaignId,
+      contractId: req.body.contractId || req.body.replaceContractId || "",
+    });
+
+    if (
+      existingUploaded &&
+      !canBrandReplaceUploadedOwnContract(
+        existingUploaded.contract,
+        existingUploaded.document || {}
+      )
+    ) {
+      return respondError(
+        res,
+        "Cannot replace this uploaded contract because it is signed or the creator has already uploaded the signed PDF.",
+        400
+      );
+    }
+
     const upload = await createContractUploadUrl({
       brandId,
       influencerId,
@@ -4338,6 +4583,9 @@ exports.sendUploadedOwnContract = async (req, res) => {
       uploadedContract,
       isResend = false,
       resendOf = "",
+      replaceContractId = "",
+      existingContractId = "",
+      contractId: contractIdFromBody = "",
     } = req.body;
 
     assertRequired(req.body, ["brandId", "influencerId", "campaignId"]);
@@ -4443,6 +4691,111 @@ exports.sendUploadedOwnContract = async (req, res) => {
       }
     }
 
+    const replaceCandidateId =
+      replaceContractId || existingContractId || contractIdFromBody || "";
+
+    const replacementTarget = !parent
+      ? await findLatestUploadedOwnContractForPair({
+          brandId,
+          influencerId,
+          campaignId,
+          contractId: replaceCandidateId,
+        })
+      : null;
+
+    if (replacementTarget?.contract) {
+      if (
+        String(replacementTarget.contract.brandId) !== String(brandId) ||
+        String(replacementTarget.contract.influencerId) !== String(influencerId) ||
+        String(replacementTarget.contract.campaignId) !== String(campaignId)
+      ) {
+        return respondError(
+          res,
+          "Contract does not match provided brand, influencer, and campaign.",
+          400
+        );
+      }
+
+      if (
+        !canBrandReplaceUploadedOwnContract(
+          replacementTarget.contract,
+          replacementTarget.document || {}
+        )
+      ) {
+        return respondError(
+          res,
+          "Cannot replace this uploaded contract because it is signed or the creator has already uploaded the signed PDF.",
+          400
+        );
+      }
+
+      const contract = await replaceUploadedOwnContractFile({
+        req,
+        contract: replacementTarget.contract,
+        existingDocument: replacementTarget.document || {},
+        uploadedContract,
+        brandId,
+        influencerId,
+        campaignId,
+        requestedEffectiveDate,
+        requestedEffectiveDateTimezone,
+      });
+
+      shouldDeleteUploadedObject = false;
+
+      await createAndEmit({
+        recipientType: "influencer",
+        influencerId: String(influencerId),
+        type: "contract.updated",
+        title: `Contract updated by ${brandDoc.name || "Brand"}`,
+        message: `Brand replaced the uploaded contract for "${
+          campaign.productOrServiceName || campaign.campaignTitle || "Campaign"
+        }". Please review the latest uploaded contract.`,
+        entityType: "contract",
+        entityId: String(contract.contractId),
+        actionPath: "/influencer/my-campaign",
+        meta: { campaignId, brandId, influencerId },
+      }).catch(() => null);
+
+      await createAndEmit({
+        recipientType: "brand",
+        brandId: String(brandId),
+        type: "contract.updated.self",
+        title: "Uploaded contract replaced",
+        message: `You replaced the uploaded contract for ${
+          influencerDoc.name || "Influencer"
+        }.`,
+        entityType: "contract",
+        entityId: String(contract.contractId),
+        actionPath: `/brand/created-campaign/applied-inf?id=${campaignId}`,
+        meta: { campaignId, influencerId },
+      }).catch(() => null);
+
+      const hydrated = await hydrateContract(contract);
+
+      await safeSendEmail({
+        contract: hydrated,
+        templateKey: "contract_new_received_influencer",
+        to: getEmailForRole({
+          contract: hydrated,
+          role: "influencer",
+          influencerDoc,
+        }),
+        recipientRole: "influencer",
+        recipientName: getNameForRole({
+          contract: hydrated,
+          role: "influencer",
+          influencerDoc,
+        }),
+      });
+
+      return respondOK(res, {
+        message: "Uploaded contract replaced successfully",
+        contract: hydrated,
+        replaced: true,
+      });
+    }
+
     const contract = await createContractRecord({
       req,
       brandId,
@@ -4474,20 +4827,22 @@ exports.sendUploadedOwnContract = async (req, res) => {
         $set: {
           documentSource: "uploaded",
           pdfUrl: "",
-          uploadedContract: {
-            originalName: uploadedContract.originalName,
-            bucket: CONTRACT_BUCKET,
-            folder: CONTRACT_FOLDER,
-            key: uploadedContract.key,
-            mimeType: "application/pdf",
-            sizeBytes: Number(uploadedContract.sizeBytes || 0),
+          uploadedContract: buildUploadedOwnContractFileSnapshot({
+            uploadedContract,
             uploadedBy:
               req.user?.id ||
               req.user?._id ||
               req.user?.email ||
               String(brandId),
-            uploadedAt: new Date(),
-          },
+          }),
+          brandUploadedContract: buildUploadedOwnContractFileSnapshot({
+            uploadedContract,
+            uploadedBy:
+              req.user?.id ||
+              req.user?._id ||
+              req.user?.email ||
+              String(brandId),
+          }),
           acknowledgement: {
             version: 1,
             title: "CollabGlam Uploaded Contract Acknowledgement",
