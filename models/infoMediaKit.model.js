@@ -50,6 +50,27 @@ const InfoMediaKitSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
+    // Store creator email at top-level so it is visible directly in the infomediakit table.
+    // This is the original email. Frontend is responsible for masking before display.
+    email: {
+      type: String,
+      default: '',
+      trim: true,
+      index: true,
+    },
+    emails: {
+      type: [String],
+      default: [],
+    },
+    website: {
+      type: String,
+      default: '',
+      trim: true,
+    },
+    socialLinks: {
+      type: [mongoose.Schema.Types.Mixed],
+      default: [],
+    },
     mediaKitData: {
       type: mongoose.Schema.Types.Mixed,
       default: {},
@@ -76,6 +97,7 @@ const InfoMediaKitSchema = new mongoose.Schema(
 );
 
 InfoMediaKitSchema.index({ platform: 1, channelId: 1 });
+InfoMediaKitSchema.index({ email: 1 });
 InfoMediaKitSchema.index({ channelName: 'text' });
 
 module.exports =
