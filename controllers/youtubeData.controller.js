@@ -2171,7 +2171,9 @@ function buildBrandMediaKitData(creator, context = {}) {
 
   const contact = {
     hasContactInfo: Boolean(emails.length || websites.length || socialLinks.length),
-    maskedEmail: emails[0] ? maskEmailForBrand(emails[0]) : '',
+    // Keep original email in API response. Frontend is responsible for masking display.
+    email: emails[0] || '',
+    maskedEmail: emails[0] || '',
     website: websites[0] || '',
     socialLinks: socialLinks.map((url) => {
       let platform = 'Website';
