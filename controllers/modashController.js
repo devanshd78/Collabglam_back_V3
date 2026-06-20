@@ -3810,28 +3810,28 @@ async function frontendReport(req, res) {
             out._modashProfileId = String(cached._id);
           }
 
-          try {
-            await chargeProfileViewAfterSuccess({
-              shouldChargeProfileView,
-              alreadyViewedThisPeriod,
-              brandId,
-              platform,
-              userId: resolvedUserId,
-              influencerId,
-              periodKey,
-              at: now,
-            });
-          } catch (e) {
-            if (e.status === 403 || e.code === 'QUOTA_EXCEEDED') {
-              await saveErrorLog(req, e, 403, "FRONTEND_REPORT_ERROR");
-              return res.status(403).json({
-                error: 'You have reached your monthly profile view limit.',
-                meta: e.meta,
-              });
-            }
+          // try {
+          //   await chargeProfileViewAfterSuccess({
+          //     shouldChargeProfileView,
+          //     alreadyViewedThisPeriod,
+          //     brandId,
+          //     platform,
+          //     userId: resolvedUserId,
+          //     influencerId,
+          //     periodKey,
+          //     at: now,
+          //   });
+          // } catch (e) {
+          //   if (e.status === 403 || e.code === 'QUOTA_EXCEEDED') {
+          //     await saveErrorLog(req, e, 403, "FRONTEND_REPORT_ERROR");
+          //     return res.status(403).json({
+          //       error: 'You have reached your monthly profile view limit.',
+          //       meta: e.meta,
+          //     });
+          //   }
 
-            throw e;
-          }
+          //   throw e;
+          // }
 
           return res.json(out);
         }
@@ -3942,28 +3942,28 @@ async function frontendReport(req, res) {
       canShowSensitive
     );
 
-    try {
-      await chargeProfileViewAfterSuccess({
-        shouldChargeProfileView,
-        alreadyViewedThisPeriod,
-        brandId,
-        platform,
-        userId: resolvedUserId,
-        influencerId,
-        periodKey,
-        at: fetchedAt,
-      });
-    } catch (e) {
-      if (e.status === 403 || e.code === 'QUOTA_EXCEEDED') {
-        await saveErrorLog(req, e, 403, "FRONTEND_REPORT_ERROR");
-        return res.status(403).json({
-          error: 'You have reached your monthly profile view limit.',
-          meta: e.meta,
-        });
-      }
+    // try {
+    //   await chargeProfileViewAfterSuccess({
+    //     shouldChargeProfileView,
+    //     alreadyViewedThisPeriod,
+    //     brandId,
+    //     platform,
+    //     userId: resolvedUserId,
+    //     influencerId,
+    //     periodKey,
+    //     at: fetchedAt,
+    //   });
+    // } catch (e) {
+    //   if (e.status === 403 || e.code === 'QUOTA_EXCEEDED') {
+    //     await saveErrorLog(req, e, 403, "FRONTEND_REPORT_ERROR");
+    //     return res.status(403).json({
+    //       error: 'You have reached your monthly profile view limit.',
+    //       meta: e.meta,
+    //     });
+    //   }
 
-      throw e;
-    }
+    //   throw e;
+    // }
 
     return res.json(out);
   } catch (err) {

@@ -1302,28 +1302,48 @@ function passesCampaignRules(doc, campaignDetails = {}) {
 }
 
 async function refreshChannelsForCampaign(campaignDetails) {
-  const searchQueries = buildCampaignSearchQueries(campaignDetails);
-  if (!searchQueries.length) return 0;
-
+  const rawLimit = Math.max(
+    1,
+    Number(campaignDetails.rawChannelLimit || campaignDetails.rawChannelsPerSearch || RAW_CHANNELS_PER_SEARCH)
+  );
   const targetSaveCount = Math.min(
-    RAW_CHANNELS_PER_SEARCH,
+    rawLimit,
     Math.max(
-      TARGET_CHANNELS_PER_SEARCH,
+      1,
       Number(campaignDetails.targetSaveCount || TARGET_CHANNELS_PER_SEARCH)
     )
   );
+  const maxSearchQueries = Math.max(
+    1,
+    Number(campaignDetails.maxSearchQueries || MAX_SEARCH_QUERIES)
+  );
+  const searchResultsPerQuery = Math.max(
+    1,
+    Number(campaignDetails.searchResultsPerQuery || SEARCH_RESULTS_PER_QUERY)
+  );
+  const recentVideoSample = Math.max(
+    1,
+    Number(campaignDetails.recentVideoSample || RECENT_VIDEO_SAMPLE)
+  );
+  const maxDiscoveryMs = Number(campaignDetails.maxDiscoveryMs || 0);
+  const startedAt = Date.now();
+  const shouldStopForTime = () => Boolean(maxDiscoveryMs && Date.now() - startedAt >= maxDiscoveryMs);
+
+  const searchQueries = buildCampaignSearchQueries(campaignDetails).slice(0, maxSearchQueries);
+  if (!searchQueries.length) return 0;
+
   const discoveryMap = new Map();
 
-  // Build a large raw pool first. Filters like Macro can shrink results heavily,
-  // so we collect more raw channels before applying subscriber/view rules.
+  // Build a bounded raw pool first. This keeps campaign/browse discovery fast enough
+  // for production while still using the same Apps Script style search -> channel -> recent video flow.
   for (const query of searchQueries) {
-    if (discoveryMap.size >= RAW_CHANNELS_PER_SEARCH) break;
+    if (discoveryMap.size >= rawLimit || shouldStopForTime()) break;
 
     const channels = await searchVideoCreatorChannels(
       query,
-      SEARCH_RESULTS_PER_QUERY,
+      searchResultsPerQuery,
       campaignDetails.campaignNiche,
-      RAW_CHANNELS_PER_SEARCH,
+      rawLimit,
       campaignDetails.targetCountry
     );
 
@@ -1335,7 +1355,7 @@ async function refreshChannelsForCampaign(campaignDetails) {
         });
       }
 
-      if (discoveryMap.size >= RAW_CHANNELS_PER_SEARCH) break;
+      if (discoveryMap.size >= rawLimit) break;
     }
   }
 
@@ -1348,13 +1368,16 @@ async function refreshChannelsForCampaign(campaignDetails) {
   let aiAnalyses = 0;
 
   for (const channel of channels) {
+    if (shouldStopForTime()) break;
+
     const discoveryInfo = discoveryMap.get(channel.id);
     try {
       const uploadsPlaylistId = channel?.contentDetails?.relatedPlaylists?.uploads || null;
-      const videos = await fetchRecentVideos(uploadsPlaylistId, RECENT_VIDEO_SAMPLE);
+      const videos = await fetchRecentVideos(uploadsPlaylistId, recentVideoSample);
       let doc = buildCreatorDoc(channel, videos, campaignDetails, discoveryInfo, searchQueries);
 
       if (
+        !campaignDetails.skipOpenAIAnalysis &&
         OPENAI_ANALYSIS_ENABLED &&
         (OPENAI_MAX_ANALYSIS_PER_REQUEST <= 0 || aiAnalyses < OPENAI_MAX_ANALYSIS_PER_REQUEST)
       ) {
@@ -1379,6 +1402,16 @@ async function refreshChannelsForCampaign(campaignDetails) {
         { upsert: true }
       );
       upserts += 1;
+
+      if (typeof campaignDetails.onCreatorSaved === 'function') {
+        const shouldContinue = await campaignDetails.onCreatorSaved({
+          doc,
+          campaignContext,
+          discoveryInfo,
+          savedCount: upserts,
+        });
+        if (shouldContinue === false) break;
+      }
 
       // Stop after saving the requested discovery target.
       if (upserts >= targetSaveCount) break;
@@ -1567,9 +1600,265 @@ function sortDiscoveryDataForSelectedFilters(items = [], context = {}) {
   });
 }
 
+
+/* -------------------------------------------------------------------------- */
+/*                    Incremental 5-by-5 discovery job helpers                */
+/* -------------------------------------------------------------------------- */
+
+const DISCOVERY_BATCH_SIZE = Number(process.env.YOUTUBE_DISCOVERY_BATCH_SIZE || 5);
+const DISCOVERY_JOB_TTL_MS = Number(process.env.YOUTUBE_DISCOVERY_JOB_TTL_MS || 20 * 60 * 1000);
+const discoveryJobs = new Map();
+
+function makeDiscoveryJobId(prefix = 'ytjob') {
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function getCreatorUniqueKeyForJob(creator = {}) {
+  return cleanStr(
+    creator.channelId ||
+      creator.ids?.youtubeChannelId ||
+      creator.channelUrl ||
+      creator.channelName
+  ).toLowerCase();
+}
+
+function createDiscoveryJob({ type, target = 25, limit = 50, batchSize = DISCOVERY_BATCH_SIZE, meta = {} }) {
+  const jobId = makeDiscoveryJobId(type || 'ytjob');
+  const job = {
+    jobId,
+    type,
+    target: Math.max(1, Number(target || 25)),
+    limit: Math.max(1, Number(limit || 50)),
+    batchSize: Math.max(1, Number(batchSize || DISCOVERY_BATCH_SIZE)),
+    meta,
+    data: [],
+    seen: new Set(),
+    done: false,
+    processing: true,
+    error: '',
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  };
+
+  discoveryJobs.set(jobId, job);
+  setTimeout(() => discoveryJobs.delete(jobId), DISCOVERY_JOB_TTL_MS).unref?.();
+  return job;
+}
+
+function addCreatorToDiscoveryJob(job, creator, sorter) {
+  if (!job || !creator) return false;
+  const key = getCreatorUniqueKeyForJob(creator);
+  if (!key || job.seen.has(key)) return false;
+
+  job.seen.add(key);
+  job.data.push(creator);
+  if (typeof sorter === 'function') {
+    job.data = sorter(job.data).slice(0, job.limit);
+  } else {
+    job.data = job.data.slice(0, job.limit);
+  }
+  job.updatedAt = new Date();
+  return true;
+}
+
+function finishDiscoveryJob(job, error = '') {
+  if (!job) return;
+  job.done = true;
+  job.processing = false;
+  job.error = error || '';
+  job.updatedAt = new Date();
+}
+
+function getVisibleJobData(job) {
+  if (!job) return [];
+  if (job.done) return job.data.slice(0, job.limit);
+
+  // Only expose full 5-row batches while a job is running. This prevents
+  // the frontend from flickering 1, 2, 3 rows and matches the Apps Script
+  // incremental write feel: show a useful chunk, then append the next chunk.
+  const visibleCount = Math.floor(job.data.length / job.batchSize) * job.batchSize;
+  return job.data.slice(0, Math.min(visibleCount, job.limit));
+}
+
+function buildJobResponse(job, extra = {}) {
+  const data = getVisibleJobData(job);
+  return {
+    success: true,
+    mode: 'incremental',
+    jobId: job.jobId,
+    type: job.type,
+    processing: job.processing,
+    done: job.done,
+    error: job.error || '',
+    batchSize: job.batchSize,
+    target: job.target,
+    limit: job.limit,
+    count: data.length,
+    returnedCount: data.length,
+    totalFound: job.data.length,
+    data,
+    creators: data,
+    recommendations: data,
+    recommendedCreators: data,
+    meta: job.meta || {},
+    ...extra,
+  };
+}
+
+function startDiscoveryJob(job, worker) {
+  Promise.resolve()
+    .then(worker)
+    .then(() => finishDiscoveryJob(job))
+    .catch((err) => {
+      finishDiscoveryJob(job, err?.message || 'Discovery job failed');
+      try {
+        saveErrorLog({}, err, err?.status || 500, `YOUTUBE_${String(job.type || 'DISCOVERY').toUpperCase()}_JOB`);
+      } catch (_) {}
+    });
+}
+
+async function getYouTubeDiscoveryJob(req, res) {
+  const jobId = cleanStr(req.params.jobId || req.query.jobId);
+  const job = discoveryJobs.get(jobId);
+
+  if (!job) {
+    return res.status(404).json({
+      success: false,
+      error: 'Discovery job not found or expired',
+    });
+  }
+
+  return res.status(200).json(buildJobResponse(job));
+}
+
+function shouldUseIncrementalMode(_q = {}) {
+  // Incremental 5-row streaming is disabled. Browse and invitation now return
+  // one accurate response: 25 minimum for invite, 50 for Browse.
+  return false;
+}
+
 /* -------------------------------------------------------------------------- */
 /*                                Controllers                                 */
 /* -------------------------------------------------------------------------- */
+
+async function startBrowseIncrementalJob({
+  req,
+  res,
+  campaignDetails,
+  filter,
+  context,
+  campaignId,
+  keyword,
+  category,
+  country,
+  minSubscribers,
+  maxSubscribers,
+  minAvgViews,
+  strictFilters,
+  strictCountry,
+  limit,
+  minimumResults,
+  sort,
+  shouldRefresh,
+}) {
+  const q = { ...req.query, ...req.body };
+  const batchSize = Math.max(1, toIntOrNull(q.batchSize) || DISCOVERY_BATCH_SIZE);
+  const job = createDiscoveryJob({
+    type: 'browse-creators',
+    target: minimumResults,
+    limit,
+    batchSize,
+    meta: {
+      campaignId,
+      keyword,
+      category,
+      country,
+      subscriberTier: context.subscriberTier,
+      minSubscribers,
+      maxSubscribers,
+      strictCountry,
+      source: 'browse-influencer',
+    },
+  });
+
+  const addBrowseCreator = (creatorOrDoc) => {
+    const creator = creatorOrDoc?.filterMatch
+      ? creatorOrDoc
+      : creatorListDTO(creatorOrDoc, context);
+
+    if (country && !isCountryMatchForFilter(creator, country)) return false;
+
+    return addCreatorToDiscoveryJob(job, creator, (items) =>
+      sortDiscoveryDataForSelectedFilters(items, context)
+    );
+  };
+
+  startDiscoveryJob(job, async () => {
+    const cachedDocs = await YouTubeData.find(filter)
+      .sort(SORT_MAP[sort] || SORT_MAP.relevance)
+      .limit(Math.max(limit, minimumResults))
+      .lean();
+
+    for (const doc of cachedDocs) {
+      addBrowseCreator(doc);
+      if (job.data.length >= limit) break;
+    }
+
+    if (job.data.length >= limit || (!shouldRefresh && job.data.length >= minimumResults)) return;
+
+    if (shouldRefresh) {
+      await refreshChannelsForCampaign({
+        ...campaignDetails,
+        campaignNiche: category || campaignDetails.campaignNiche || keyword,
+        productName: campaignDetails.productName || keyword,
+        targetCountry: country,
+        minSubscribers: null,
+        maxSubscribers: null,
+        minAvgViews,
+        strictFilters,
+        strictCountry,
+        targetSaveCount: Math.min(50, Math.max(limit, minimumResults)),
+        rawChannelLimit: Math.min(120, Math.max(limit * 2, minimumResults * 2, 60)),
+        recentVideoSample: 8,
+        maxSearchQueries: 8,
+        searchResultsPerQuery: 25,
+        maxDiscoveryMs: 285000,
+        skipOpenAIAnalysis: true,
+        keywords: Array.from(new Set([...(campaignDetails.keywords || []), keyword, category].filter(Boolean))),
+        onCreatorSaved: async ({ doc }) => {
+          addBrowseCreator(doc);
+          return job.data.length < limit;
+        },
+      });
+    }
+
+    const finalDocs = await YouTubeData.find(filter)
+      .sort(SORT_MAP[sort] || SORT_MAP.relevance)
+      .limit(Math.max(limit * 2, minimumResults * 2))
+      .lean();
+
+    for (const doc of finalDocs) {
+      addBrowseCreator(doc);
+      if (job.data.length >= limit) break;
+    }
+  });
+
+  return res.status(202).json(buildJobResponse(job, {
+    campaignId,
+    refreshedCount: 0,
+    activityLookbackDays: CREATOR_LOOKBACK_DAYS,
+    activityLookbackStartDate: getCreatorLookbackStartDate(),
+    pagination: {
+      page: 1,
+      limit,
+      total: getVisibleJobData(job).length,
+      totalPages: 1,
+      hasNextPage: false,
+      hasPrevPage: false,
+      frontendPagination: true,
+    },
+  }));
+}
 
 async function browseCreators(req, res) {
   try {
@@ -1593,39 +1882,18 @@ async function browseCreators(req, res) {
     const sort = SORT_MAP[cleanStr(q.sort)] ? cleanStr(q.sort) : 'relevance';
     const frontendPagination = String(q.frontendPagination || '').toLowerCase() === 'true';
     const page = frontendPagination ? 1 : Math.max(1, toIntOrNull(q.page) || 1);
-    const limitCap = frontendPagination ? 250 : 50;
+    const limitCap = frontendPagination ? 50 : 50;
     const limit = Math.min(limitCap, Math.max(1, toIntOrNull(q.limit) || 25));
     const skip = frontendPagination ? 0 : (page - 1) * limit;
     const mongoLimit = frontendPagination
-      ? Math.min(500, Math.max(limit, TARGET_CHANNELS_PER_SEARCH, limit * 5))
+      ? Math.min(100, Math.max(limit, 50))
       : limit;
 
     let liveError = null;
     let refreshedCount = 0;
-    const shouldRefresh = Boolean(campaignId) || Boolean(cleanStr(q.keyword || q.search)) || Boolean(requestedCategory);
-
-    if (shouldRefresh) {
-      try {
-        refreshedCount = await refreshChannelsForCampaign({
-          ...campaignDetails,
-          campaignNiche: requestedCategory || campaignDetails.campaignNiche || keyword,
-          productName: campaignDetails.productName || keyword,
-          targetCountry: country,
-          minSubscribers,
-          maxSubscribers,
-          minAvgViews,
-          strictFilters,
-          strictCountry,
-          targetSaveCount: frontendPagination && country
-            ? Math.min(RAW_CHANNELS_PER_SEARCH, Math.max(limit * 3, TARGET_CHANNELS_PER_SEARCH))
-            : TARGET_CHANNELS_PER_SEARCH,
-          keywords: Array.from(new Set([...(campaignDetails.keywords || []), keyword, requestedCategory].filter(Boolean))),
-        });
-      } catch (err) {
-        liveError = err?.message || 'YouTube live fetch failed. Showing cached data.';
-        await saveErrorLog(req, err, err?.status || 429, 'YOUTUBE_LIVE_FETCH');
-      }
-    }
+    const fastMode = String(q.fast ?? 'true').toLowerCase() !== 'false' || frontendPagination;
+    const minimumResults = Math.min(50, Math.max(25, toIntOrNull(q.minimumResults) || 25));
+    let shouldRefresh = Boolean(campaignId) || Boolean(cleanStr(q.keyword || q.search)) || Boolean(requestedCategory);
 
     const activeSinceDate = getCreatorLookbackStartDate();
 
@@ -1652,6 +1920,67 @@ async function browseCreators(req, res) {
       subscriberTier: q.subscriberTier,
       strictFilters,
     };
+
+    if (shouldUseIncrementalMode(q)) {
+      return startBrowseIncrementalJob({
+        req,
+        res,
+        campaignDetails,
+        filter,
+        context,
+        campaignId,
+        keyword,
+        category,
+        country,
+        minSubscribers,
+        maxSubscribers,
+        minAvgViews,
+        strictFilters,
+        strictCountry,
+        limit,
+        minimumResults,
+        sort,
+        shouldRefresh,
+      });
+    }
+
+    // Browse page should respond quickly. If matching cached creators already exist,
+    // return them immediately instead of starting a full YouTube discovery again.
+    if (shouldRefresh && fastMode && String(q.forceRefresh || q.force || '').toLowerCase() !== 'true') {
+      const cachedCount = await YouTubeData.countDocuments(filter).catch(() => 0);
+      if (cachedCount >= Math.min(limit, minimumResults)) {
+        shouldRefresh = false;
+      }
+    }
+
+    if (shouldRefresh) {
+      try {
+        refreshedCount = await refreshChannelsForCampaign({
+          ...campaignDetails,
+          campaignNiche: requestedCategory || campaignDetails.campaignNiche || keyword,
+          productName: campaignDetails.productName || keyword,
+          targetCountry: country,
+          minSubscribers: fastMode ? null : minSubscribers,
+          maxSubscribers: fastMode ? null : maxSubscribers,
+          minAvgViews,
+          strictFilters,
+          strictCountry,
+          // Browse only needs up to 50 relevant creators. Keep discovery bounded
+          // so the API returns inside the normal request window.
+          targetSaveCount: fastMode ? 50 : TARGET_CHANNELS_PER_SEARCH,
+          rawChannelLimit: fastMode ? 120 : undefined,
+          recentVideoSample: fastMode ? 6 : undefined,
+          maxSearchQueries: fastMode ? 6 : undefined,
+          searchResultsPerQuery: fastMode ? 20 : undefined,
+          maxDiscoveryMs: fastMode ? 240000 : undefined,
+          skipOpenAIAnalysis: fastMode,
+          keywords: Array.from(new Set([...(campaignDetails.keywords || []), keyword, requestedCategory].filter(Boolean))),
+        });
+      } catch (err) {
+        liveError = err?.message || 'YouTube live fetch failed. Showing cached data.';
+        await saveErrorLog(req, err, err?.status || 429, 'YOUTUBE_LIVE_FETCH');
+      }
+    }
 
     const items = await YouTubeData.find(filter)
       .sort(SORT_MAP[sort])
@@ -2019,48 +2348,124 @@ function getRecommendationNegativeTerms(campaignDetails = {}) {
   return base;
 }
 
-function scoreCreatorForRecommendation(creator = {}, campaignDetails = {}) {
-  const positiveTerms = getRecommendationPositiveTerms(campaignDetails);
+function getRecommendationCoreTerms(campaignDetails = {}) {
+  const baseTerms = getRecommendationPositiveTerms(campaignDetails)
+    .map((x) => cleanStr(x).toLowerCase())
+    .filter((x) => x && x.length >= 3)
+    .filter((x) => !/campaign|marketing|awareness|sales|creator|creators|youtube|google|budget|platform|product review|unboxing|review|comparison|test|demo|top|best/.test(x));
+
+  const joined = [
+    campaignDetails.rawCampaignTitle,
+    campaignDetails.rawCampaignCategory,
+    campaignDetails.rawCampaignSubcategory,
+    ...(campaignDetails.keywords || []),
+  ].join(' ').toLowerCase();
+
+  if (/drone|dji|mavic|fpv|uav|aerial|action\s*cam|gopro|insta360|osmo/.test(joined)) {
+    return uniqueCleanValues([
+      'drone',
+      'drones',
+      'drone camera',
+      'camera drone',
+      'aerial photography',
+      'aerial videography',
+      'fpv drone',
+      'fpv',
+      'uav',
+      'dji',
+      'mavic',
+      'mini drone',
+      'action camera',
+      'gopro',
+      'insta360',
+      'osmo',
+      'osmo action',
+    ]);
+  }
+
+  return uniqueCleanValues(baseTerms).slice(0, 16);
+}
+
+function countRecommendationTermHits(text = '', terms = []) {
+  const hay = cleanStr(text).toLowerCase();
+  let count = 0;
+  for (const term of terms) {
+    const t = cleanStr(term).toLowerCase();
+    if (t && hay.includes(t)) count += 1;
+  }
+  return count;
+}
+
+function countRecentVideoMatchesForTerms(videos = [], terms = []) {
+  return (Array.isArray(videos) ? videos : [])
+    .slice(0, 25)
+    .filter((video) => countRecommendationTermHits(`${video.title || ''} ${video.description || ''}`, terms) > 0)
+    .length;
+}
+
+function isHardRejectedRecommendationCreator(creator = {}, campaignDetails = {}) {
   const negativeTerms = getRecommendationNegativeTerms(campaignDetails);
   const nameText = cleanStr(creator.channelName);
   const descriptionText = cleanStr(creator.description || creator.channelDescription);
   const tagsText = (creator.channelTags || []).join(' ');
   const recentText = (creator.recentVideos || creator.recentVideoTitles || [])
-    .slice(0, 15)
+    .slice(0, 10)
+    .map((video) => `${video.title || ''} ${video.description || ''}`)
+    .join(' ');
+  const categoryText = cleanStr(`${creator.category || ''} ${creator.channelCategory || ''}`);
+  const allText = `${nameText} ${descriptionText} ${tagsText} ${recentText} ${categoryText}`.toLowerCase();
+  const contentFlag = cleanStr(creator.contentFlag).toLowerCase();
+
+  if (contentFlag.includes('brand') || contentFlag.includes('compilation') || contentFlag.includes('ai generated')) return true;
+  if (/official youtube channel|official channel|home to everything|welcome to the official/i.test(descriptionText)) return true;
+  if (/news|publication|trade|media outlet|official/i.test(categoryText)) return true;
+
+  // Avoid agency recommendations that are clearly not independent creators for the campaign niche.
+  if (textIncludesAny(allText, negativeTerms)) return true;
+
+  return false;
+}
+
+function scoreCreatorForRecommendation(creator = {}, campaignDetails = {}) {
+  if (isHardRejectedRecommendationCreator(creator, campaignDetails)) return 0;
+
+  const coreTerms = getRecommendationCoreTerms(campaignDetails);
+  const nameText = cleanStr(creator.channelName);
+  const descriptionText = cleanStr(creator.description || creator.channelDescription);
+  const tagsText = (creator.channelTags || []).join(' ');
+  const recentVideos = creator.recentVideos || creator.recentVideoTitles || [];
+  const recentText = recentVideos
+    .slice(0, 25)
     .map((video) => `${video.title || ''} ${video.description || ''}`)
     .join(' ');
   const sourceText = cleanStr(`${creator.sourceVideoTitle || ''} ${creator.foundViaQuery || ''}`);
-  const categoryText = cleanStr(`${creator.category || ''} ${creator.channelCategory || ''}`);
-  const allText = `${nameText} ${descriptionText} ${tagsText} ${recentText} ${sourceText} ${categoryText}`.toLowerCase();
+
+  const channelText = `${nameText} ${descriptionText} ${tagsText}`;
+  const channelHits = countRecommendationTermHits(channelText, coreTerms);
+  const recentMatches = countRecentVideoMatchesForTerms(recentVideos, coreTerms);
+  const sourceHits = countRecommendationTermHits(sourceText, coreTerms);
+  const reviewSignals = countRecommendationTermHits(
+    `${channelText} ${recentText}`,
+    ['review', 'unboxing', 'test', 'tested', 'tutorial', 'demo', 'comparison', 'hands on', 'setup']
+  );
 
   let score = 0;
-  const channelText = `${nameText} ${descriptionText} ${tagsText} ${categoryText}`.toLowerCase();
-  const recentLower = recentText.toLowerCase();
-  const sourceLower = sourceText.toLowerCase();
+  score += Math.min(42, channelHits * 14);
+  score += Math.min(42, recentMatches * 8);
+  score += Math.min(12, reviewSignals * 3);
+  score += Math.min(6, sourceHits * 2);
 
-  for (const term of positiveTerms) {
-    const t = cleanStr(term).toLowerCase();
-    if (!t || t.length < 3) continue;
-    if (channelText.includes(t)) score += 16;
-    if (recentLower.includes(t)) score += 8;
-    if (sourceLower.includes(t)) score += 4;
+  // Source-video-only matches are weak. A creator should have the niche in their
+  // channel profile/tags or multiple recent videos, not just one search result.
+  if (sourceHits > 0 && channelHits === 0 && recentMatches < 2) {
+    score = Math.min(score, 30);
   }
 
-  for (const term of negativeTerms) {
-    const t = cleanStr(term).toLowerCase();
-    if (t && allText.includes(t)) score -= 22;
-  }
-
-  const contentFlag = cleanStr(creator.contentFlag).toLowerCase();
-  if (contentFlag.includes('brand') || contentFlag.includes('compilation') || contentFlag.includes('ai generated')) score -= 35;
-
-  if (/official youtube channel|official channel|home to everything|welcome to the official/i.test(descriptionText)) score -= 45;
-
-  const category = cleanStr(creator.category || creator.channelCategory).toLowerCase();
-  if (/news|publication|trade|media outlet|official/i.test(category)) score -= 40;
-
-  if (textIncludesAny(allText, ['review', 'unboxing', 'test', 'tested', 'tutorial', 'demo', 'comparison', 'hands on'])) score += 12;
-  if (textIncludesAny(allText, ['sponsored', '#ad', 'partnered', 'collaboration'])) score += 4;
+  const avgViews = Number(creator.avgViews || 0);
+  const engagement = Number(creator.engagementRate || 0);
+  if (avgViews >= 10000) score += 4;
+  if (engagement >= 1) score += 4;
+  if (engagement >= 3) score += 4;
 
   return Math.max(0, Math.min(100, Math.round(score)));
 }
@@ -2090,12 +2495,22 @@ function splitCreatorsByRecommendationFit(creators = [], campaignDetails = {}, c
     const countryMatch = !hasCountry || cleanStr(creator.country).toUpperCase() === targetCountry;
     const tierMatch = !hasTier || isSubscriberTierMatch(creator.subscribers || creator.subscriberCount, context.minSubscribers, context.maxSubscribers);
     const relevanceMatch = creatorMatchesRecommendationRelevance(creator, campaignDetails);
+    const recommendationScore = Number(creator.recommendationMatchScore || creator.scores?.recommendationMatchScore || 0);
+
+    // Same idea as the original Apps Script creator discovery flow: a creator found
+    // from the campaign query/source video is still useful even when their channel
+    // profile text is not keyword-heavy. Keep these as a second-priority fallback
+    // so the invite API can return up to 25 relevant creators instead of only the
+    // few creators that pass the very strict campaignCategoryMatch threshold.
+    const sourceCampaignMatch = recommendationScore >= 25;
 
     creator.filterMatch = {
       ...(creator.filterMatch || {}),
       countryMatch,
       subscriberTierMatch: tierMatch,
       campaignCategoryMatch: relevanceMatch,
+      sourceCampaignMatch,
+      softCampaignMatch: sourceCampaignMatch,
       strictCampaignMatch: countryMatch && tierMatch && relevanceMatch,
     };
 
@@ -2104,10 +2519,19 @@ function splitCreatorsByRecommendationFit(creators = [], campaignDetails = {}, c
 
   const exact = enriched.filter((x) => x.filterMatch.strictCampaignMatch);
   const sameCountryRelevant = enriched.filter((x) => !x.filterMatch.strictCampaignMatch && x.filterMatch.countryMatch && x.filterMatch.campaignCategoryMatch);
+  const sameCountrySoft = enriched.filter((x) => !x.filterMatch.strictCampaignMatch && !x.filterMatch.campaignCategoryMatch && x.filterMatch.countryMatch && x.filterMatch.softCampaignMatch);
+  const sameCountryFallback = enriched.filter(
+    (x) =>
+      !x.filterMatch.strictCampaignMatch &&
+      x.filterMatch.countryMatch &&
+      !x.filterMatch.campaignCategoryMatch &&
+      !x.filterMatch.softCampaignMatch
+  );
   const relevantOnly = enriched.filter((x) => !x.filterMatch.countryMatch && x.filterMatch.campaignCategoryMatch);
-  const rest = enriched.filter((x) => !x.filterMatch.campaignCategoryMatch);
+  const softRelevantOnly = enriched.filter((x) => !x.filterMatch.countryMatch && !x.filterMatch.campaignCategoryMatch && x.filterMatch.softCampaignMatch);
+  const rest = enriched.filter((x) => !x.filterMatch.countryMatch && !x.filterMatch.campaignCategoryMatch && !x.filterMatch.softCampaignMatch);
 
-  return { exact, sameCountryRelevant, relevantOnly, rest };
+  return { exact, sameCountryRelevant, sameCountrySoft, sameCountryFallback, relevantOnly, softRelevantOnly, rest };
 }
 
 function sortRecommendedCreators(items = []) {
@@ -2136,9 +2560,105 @@ function sortRecommendedCreators(items = []) {
   });
 }
 
+function uniqueRecommendedCreatorsByChannel(creators = []) {
+  const seen = new Set();
+  const out = [];
+
+  for (const creator of creators) {
+    const key = cleanStr(creator?.channelId || creator?.channelUrl || creator?.channelName).toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(creator);
+  }
+
+  return out;
+}
+
+function selectCampaignRecommendationCreatorsFromSplit(split = {}, { limit = 50, hardCountry = true } = {}) {
+  const finalLimit = Math.min(50, Math.max(1, Number(limit || 50)));
+  const exact = sortRecommendedCreators(split.exact || []);
+
+  // Tier remains first priority. After exact tier+country+category matches, fill
+  // up to 25 using same-country campaign creators discovered from the campaign
+  // search terms. This matches the Apps Script style flow: query -> source video
+  // -> channel -> shortlist, instead of returning an empty/9-result page.
+  const fallbackPool = hardCountry
+    ? sortRecommendedCreators([
+        ...(split.sameCountryRelevant || []),
+        ...(split.sameCountrySoft || []),
+        ...(split.sameCountryFallback || []),
+      ])
+    : sortRecommendedCreators([
+        ...(split.sameCountryRelevant || []),
+        ...(split.sameCountrySoft || []),
+        ...(split.sameCountryFallback || []),
+        ...(split.relevantOnly || []),
+        ...(split.softRelevantOnly || []),
+        ...(split.rest || []),
+      ]);
+
+  // Always cap at 25, but do not stop at 9 just because exact-tier matches are low.
+  // The fallback pool is still built from campaign-search/source-video channels,
+  // with same-country creators first, so it follows the Apps Script-style logic.
+  return uniqueRecommendedCreatorsByChannel([...exact, ...fallbackPool]).slice(0, finalLimit);
+}
+
 function getCampaignInfluencerCollection() {
   const mongoose = require('mongoose');
   return mongoose.connection.collection('campaigninfluencers');
+}
+
+async function loadSavedCampaignInfluencerRecommendations({ campaignId, limit = 100 }) {
+  const campaignKey = cleanStr(campaignId);
+  if (!campaignKey) return [];
+
+  const collection = getCampaignInfluencerCollection();
+  const rows = await collection
+    .find({
+      campaignId: campaignKey,
+      platform: 'youtube',
+      $or: [
+        { savedFromRecommendation: true },
+        { source: /^youtube_campaign_recommendation/ },
+        { status: 'recommended' },
+      ],
+    })
+    .sort({ recommendationMatchScore: -1, shortlistScore: -1, subscribers: -1, savedAt: -1 })
+    .limit(Math.max(1, Number(limit || 100)))
+    .toArray();
+
+  return rows.map((row) => {
+    const raw = row.rawCreator && typeof row.rawCreator === 'object' ? row.rawCreator : {};
+    return {
+      ...raw,
+      channelId: raw.channelId || row.channelId,
+      channelName: raw.channelName || row.channelName,
+      channelUrl: raw.channelUrl || row.channelUrl,
+      thumbnail: raw.thumbnail || row.thumbnail,
+      category: raw.category || row.category,
+      channelCategory: raw.channelCategory || row.channelCategory || row.category,
+      creatorTier: raw.creatorTier || row.creatorTier,
+      subscribers: raw.subscribers || row.subscribers,
+      subscriberCount: raw.subscriberCount || row.subscribers,
+      avgViews: raw.avgViews || row.avgViews,
+      engagementRate: raw.engagementRate || row.engagementRate,
+      country: raw.country || row.country,
+      estimatedAudienceCountry: raw.estimatedAudienceCountry || row.estimatedAudienceCountry,
+      recommendationMatchScore: raw.recommendationMatchScore || row.recommendationMatchScore || row.campaignMatchScore || 0,
+      scores: {
+        ...(raw.scores || {}),
+        recommendationMatchScore:
+          raw.scores?.recommendationMatchScore || row.recommendationMatchScore || row.campaignMatchScore || 0,
+        campaignMatchScore:
+          raw.scores?.campaignMatchScore || row.campaignMatchScore || row.recommendationMatchScore || 0,
+        shortlistScore: raw.scores?.shortlistScore || row.shortlistScore || 0,
+        relevancyScore: raw.scores?.relevancyScore || row.relevancyScore || 0,
+        authenticityScore: raw.scores?.authenticityScore || row.authenticityScore || 0,
+        brandSafetyScore: raw.scores?.brandSafetyScore || row.brandSafetyScore || 0,
+      },
+      filterMatch: raw.filterMatch || row.filterMatch || {},
+    };
+  });
 }
 
 async function saveCampaignInfluencerRecommendations({
@@ -2226,6 +2746,196 @@ async function saveCampaignInfluencerRecommendations({
   return saved;
 }
 
+async function startCampaignRecommendationIncrementalJob({
+  req,
+  res,
+  campaign,
+  campaignId,
+  brandId,
+  campaignDetails,
+  context,
+  country,
+  keyword,
+  category,
+  limit,
+  minimumInfluencers,
+  hardCountry,
+  save,
+  forceRefresh,
+}) {
+  const batchSize = Math.max(1, toIntOrNull(req.body.batchSize) || toIntOrNull(req.query.batchSize) || DISCOVERY_BATCH_SIZE);
+  const job = createDiscoveryJob({
+    type: 'campaign-recommendation',
+    target: minimumInfluencers,
+    limit,
+    batchSize,
+    meta: {
+      campaignId,
+      brandId: brandId || cleanStr(campaign.brandId),
+      title: campaignDetails.rawCampaignTitle,
+      category: campaignDetails.rawCampaignCategory,
+      subcategory: campaignDetails.rawCampaignSubcategory,
+      country,
+      subscriberTier: campaignDetails.subscriberTier,
+      minSubscribers: campaignDetails.minSubscribers,
+      maxSubscribers: campaignDetails.maxSubscribers,
+      strictCountry: hardCountry,
+      tierIsMain: true,
+    },
+  });
+
+  const addRecommendationCreator = (creator) => {
+    const split = splitCreatorsByRecommendationFit([creator], campaignDetails, context);
+    const exact = split.exact[0];
+    const sameCountryRelevant = split.sameCountryRelevant[0];
+    const relevantOnly = split.relevantOnly[0];
+
+    // Tier is main: exact campaign matches (country + selected tier + relevance) appear first.
+    // If there are not enough exact-tier creators, allow same-country relevant creators after them.
+    let candidate = exact || sameCountryRelevant;
+    if (!candidate && !hardCountry) candidate = relevantOnly;
+    if (!candidate) return false;
+
+    if (hardCountry && !candidate.filterMatch?.countryMatch) return false;
+    if (!candidate.filterMatch?.campaignCategoryMatch) return false;
+
+    return addCreatorToDiscoveryJob(job, candidate, sortRecommendedCreators);
+  };
+
+  startDiscoveryJob(job, async () => {
+    if (!forceRefresh) {
+      const savedCreators = await loadSavedCampaignInfluencerRecommendations({
+        campaignId,
+        limit: Math.max(limit * 2, minimumInfluencers * 2),
+      });
+
+      for (const creator of savedCreators) {
+        addRecommendationCreator(creator);
+        if (job.data.length >= limit) break;
+      }
+
+      if (job.data.length >= limit || job.data.length >= minimumInfluencers) {
+        if (save) {
+          await saveCampaignInfluencerRecommendations({
+            campaignId,
+            brandId: brandId || cleanStr(campaign.brandId),
+            creators: job.data.slice(0, limit),
+          });
+        }
+        return;
+      }
+    }
+
+    await refreshChannelsForCampaign({
+      ...campaignDetails,
+      productName: keyword,
+      campaignNiche: category || keyword,
+      targetCountry: country,
+      minSubscribers: null,
+      maxSubscribers: null,
+      minAvgViews: null,
+      strictFilters: false,
+      strictTier: false,
+      strictCountry: hardCountry,
+      targetSaveCount: Math.max(limit, minimumInfluencers),
+      rawChannelLimit: Math.min(180, Math.max(limit * 4, minimumInfluencers * 4, 120)),
+      recentVideoSample: 8,
+      maxSearchQueries: 8,
+      searchResultsPerQuery: 25,
+      maxDiscoveryMs: 285000,
+      skipOpenAIAnalysis: true,
+      keywords: uniqueCleanValues([
+        keyword,
+        category,
+        campaignDetails.rawCampaignCategory,
+        campaignDetails.rawCampaignSubcategory,
+        ...campaignDetails.keywords,
+      ]),
+      recommendationSearchQueries: campaignDetails.recommendationSearchQueries,
+      onCreatorSaved: async ({ doc }) => {
+        const dto = creatorListDTO(doc, context);
+        addRecommendationCreator(dto);
+        return job.data.length < limit;
+      },
+    });
+
+    // Final DB fill pass: pull saved YouTubeData rows that match current campaign context.
+    const activeSinceDate = getCreatorLookbackStartDate();
+    const loadCreators = async ({ useKeyword = true, useCategory = true, useCountry = true }) => {
+      const filter = buildMongoFilter({
+        keyword: useKeyword ? keyword : '',
+        country: useCountry && hardCountry ? country : '',
+        minSubscribers: requestedTierRange.minSubscribers,
+        maxSubscribers: requestedTierRange.maxSubscribers,
+        minAvgViews: null,
+        minEngagement: null,
+        category: useCategory ? category : '',
+        campaignId,
+        includeExcluded: false,
+        strictFilters: true,
+        activeSinceDate,
+      });
+
+      const docs = await YouTubeData.find(filter)
+        .sort(SORT_MAP.relevance)
+        .limit(Math.min(50, Math.max(limit * 2, minimumInfluencers * 2, 40)))
+        .lean();
+
+      return sortDiscoveryDataForSelectedFilters(
+        docs.map((doc) => creatorListDTO(doc, context)),
+        context
+      );
+    };
+
+    const pools = [
+      await loadCreators({ useKeyword: true, useCategory: true, useCountry: Boolean(country) }),
+      await loadCreators({ useKeyword: false, useCategory: true, useCountry: Boolean(country) }),
+    ];
+
+    if (!hardCountry) {
+      pools.push(await loadCreators({ useKeyword: false, useCategory: true, useCountry: false }));
+    }
+
+    for (const pool of pools) {
+      for (const creator of pool) {
+        addRecommendationCreator(creator);
+        if (job.data.length >= limit) break;
+      }
+      if (job.data.length >= limit) break;
+    }
+
+    if (save) {
+      await saveCampaignInfluencerRecommendations({
+        campaignId,
+        brandId: brandId || cleanStr(campaign.brandId),
+        creators: job.data.slice(0, limit),
+      });
+    }
+  });
+
+  return res.status(202).json(buildJobResponse(job, {
+    campaignId,
+    brandId: brandId || cleanStr(campaign.brandId),
+    minimumInfluencers,
+    requestedLimit: limit,
+    strictCountry: hardCountry,
+    strictTierFirst: Boolean(campaignDetails.subscriberTier),
+    campaignSearchContext: {
+      title: campaignDetails.rawCampaignTitle,
+      description: campaignDetails.rawCampaignDescription,
+      category: campaignDetails.rawCampaignCategory,
+      subcategory: campaignDetails.rawCampaignSubcategory,
+      country,
+      strictCountry: hardCountry,
+      subscriberTier: campaignDetails.subscriberTier,
+      minSubscribers: campaignDetails.minSubscribers,
+      maxSubscribers: campaignDetails.maxSubscribers,
+      keywords: campaignDetails.keywords,
+      recommendationSearchQueries: campaignDetails.recommendationSearchQueries,
+    },
+  }));
+}
+
 async function recommendInfluencersForCampaign(req, res) {
   try {
     const campaignId = cleanStr(req.params.campaignId || req.body.campaignId || req.query.campaignId);
@@ -2254,22 +2964,35 @@ async function recommendInfluencersForCampaign(req, res) {
       });
     }
 
-    const minimumInfluencers = Math.max(
-      50,
+    // Campaign recommendation should return up to 50 creators for the invite flow.
+    // Exact selected-tier creators are prioritized, then relevant fallback creators fill the list.
+    const requestedMinimum =
       toIntOrNull(req.body.minimumInfluencers) ||
-        toIntOrNull(req.body.minInfluencers) ||
-        toIntOrNull(req.query.minimumInfluencers) ||
-        toIntOrNull(req.query.minInfluencers) ||
-        50
+      toIntOrNull(req.body.minInfluencers) ||
+      toIntOrNull(req.query.minimumInfluencers) ||
+      toIntOrNull(req.query.minInfluencers) ||
+      50;
+
+    // This API returns up to 50 creators. It may return fewer when the selected
+    // campaign tier/country/category does not have enough accurate matches.
+    const maximumCampaignRecommendations = 50;
+    const minimumInfluencers = Math.min(
+      maximumCampaignRecommendations,
+      Math.max(1, requestedMinimum)
     );
 
-    const limit = Math.max(
-      minimumInfluencers,
-      Math.min(100, toIntOrNull(req.body.limit) || toIntOrNull(req.query.limit) || 100)
+    const requestedLimit =
+      toIntOrNull(req.body.limit) || toIntOrNull(req.query.limit) || maximumCampaignRecommendations;
+    const limit = Math.min(
+      maximumCampaignRecommendations,
+      Math.max(1, requestedLimit)
     );
 
     const save = String(req.body.save ?? req.query.save ?? 'true').toLowerCase() !== 'false';
     const hardCountry = String(req.body.strictCountry ?? req.query.strictCountry ?? 'true').toLowerCase() !== 'false';
+    const forceRefresh =
+      String(req.body.forceRefresh ?? req.query.forceRefresh ?? 'false').toLowerCase() === 'true' ||
+      String(req.body.force ?? req.query.force ?? 'false').toLowerCase() === 'true';
 
     const campaignDetails = await buildRecommendationCampaignDetails(campaign);
     const country = cleanStr(campaignDetails.targetCountry).toUpperCase();
@@ -2285,18 +3008,129 @@ async function recommendInfluencersForCampaign(req, res) {
       maxSubscribers: campaignDetails.maxSubscribers,
     };
 
+    const context = {
+      keyword,
+      category,
+      country,
+      minSubscribers: requestedTierRange.minSubscribers,
+      maxSubscribers: requestedTierRange.maxSubscribers,
+      subscriberTier: campaignDetails.subscriberTier,
+      // Tier is the main rule for campaign recommendations.
+      strictFilters: true,
+      strictTier: Boolean(campaignDetails.subscriberTier),
+    };
+
+    const buildResponse = ({ creators, refreshedCount = 0, savedCount = 0, fromCache = false, warning = undefined }) => ({
+      success: true,
+      campaignId,
+      brandId: brandId || cleanStr(campaign.brandId),
+      minimumInfluencers,
+      requestedLimit: limit,
+      refreshedCount,
+      savedCount,
+      count: creators.length,
+      exactMatchCount: creators.filter((x) => x.filterMatch?.strictCampaignMatch).length,
+      sameCountryRelevantCount: creators.filter((x) => x.filterMatch?.countryMatch && (x.filterMatch?.campaignCategoryMatch || x.filterMatch?.softCampaignMatch)).length,
+      strictCountry: hardCountry,
+      strictTierFirst: Boolean(campaignDetails.subscriberTier),
+      strictTier: Boolean(campaignDetails.subscriberTier),
+      maxRecommendations: limit,
+      fromCache,
+      data: creators,
+      creators,
+      recommendations: creators,
+      recommendedCreators: creators,
+      campaignSearchContext: {
+        title: campaignDetails.rawCampaignTitle,
+        description: campaignDetails.rawCampaignDescription,
+        category: campaignDetails.rawCampaignCategory,
+        subcategory: campaignDetails.rawCampaignSubcategory,
+        country,
+        strictCountry: hardCountry,
+        subscriberTier: campaignDetails.subscriberTier,
+        minSubscribers: campaignDetails.minSubscribers,
+        maxSubscribers: campaignDetails.maxSubscribers,
+        keywords: campaignDetails.keywords,
+        recommendationSearchQueries: campaignDetails.recommendationSearchQueries,
+      },
+      warning,
+    });
+
+    if (shouldUseIncrementalMode({ ...req.query, ...req.body })) {
+      return startCampaignRecommendationIncrementalJob({
+        req,
+        res,
+        campaign,
+        campaignId,
+        brandId,
+        campaignDetails,
+        context,
+        country,
+        keyword,
+        category,
+        limit,
+        minimumInfluencers,
+        hardCountry,
+        save,
+        forceRefresh,
+      });
+    }
+
+    // Fast path: if this campaign was already generated and saved, return it from DB.
+    // This prevents the invite page from starting a full YouTube discovery again on reload/back.
+    if (!forceRefresh) {
+      const savedCreators = await loadSavedCampaignInfluencerRecommendations({
+        campaignId,
+        limit: Math.max(limit * 2, minimumInfluencers * 2),
+      });
+
+      if (savedCreators.length) {
+        const savedSplit = splitCreatorsByRecommendationFit(savedCreators, campaignDetails, context);
+        // Return max 50, tier-first. If exact-tier creators are not enough,
+        // keep the invite page useful with same-country/category relevant creators.
+        let cachedCreators = selectCampaignRecommendationCreatorsFromSplit(savedSplit, {
+          limit,
+          hardCountry,
+        });
+
+        const cacheReadyCount = Math.min(limit, minimumInfluencers);
+        if (cachedCreators.length >= cacheReadyCount) {
+          return res.status(200).json(
+            buildResponse({
+              creators: cachedCreators,
+              refreshedCount: 0,
+              savedCount: 0,
+              fromCache: true,
+            })
+          );
+        }
+        // Saved campaign rows exist but are not enough for the requested 50.
+        // Continue into fresh discovery so the page can be topped up instead of
+        // repeatedly showing only 9 cached creators.
+      }
+    }
+
     const refreshedCount = await refreshChannelsForCampaign({
       ...campaignDetails,
       productName: keyword,
       campaignNiche: category || keyword,
       targetCountry: country,
-      minSubscribers: null,
-      maxSubscribers: null,
-      minAvgViews: null,
+      minSubscribers: requestedTierRange.minSubscribers,
+      maxSubscribers: requestedTierRange.maxSubscribers,
+      minAvgViews: 500,
+      // Do not hard-block discovery by tier. Tier is handled in ranking/selection
+      // so exact tier is shown first, but the API can still return 25 relevant
+      // campaign creators when the selected tier has too few exact matches.
       strictFilters: false,
       strictTier: false,
       strictCountry: hardCountry,
-      targetSaveCount: Math.max(limit * 2, minimumInfluencers * 2, TARGET_CHANNELS_PER_SEARCH),
+      targetSaveCount: Math.max(limit, minimumInfluencers),
+      rawChannelLimit: Math.min(220, Math.max(limit * 6, 180)),
+      recentVideoSample: 10,
+      maxSearchQueries: 10,
+      searchResultsPerQuery: 35,
+      maxDiscoveryMs: 270000,
+      skipOpenAIAnalysis: true,
       keywords: uniqueCleanValues([
         keyword,
         category,
@@ -2308,16 +3142,6 @@ async function recommendInfluencersForCampaign(req, res) {
     });
 
     const activeSinceDate = getCreatorLookbackStartDate();
-
-    const context = {
-      keyword,
-      category,
-      country,
-      minSubscribers: requestedTierRange.minSubscribers,
-      maxSubscribers: requestedTierRange.maxSubscribers,
-      subscriberTier: campaignDetails.subscriberTier,
-      strictFilters: false,
-    };
 
     const loadCreators = async ({ useKeyword = true, useCategory = true, useCountry = true }) => {
       const filter = buildMongoFilter({
@@ -2336,7 +3160,7 @@ async function recommendInfluencersForCampaign(req, res) {
 
       const docs = await YouTubeData.find(filter)
         .sort(SORT_MAP.relevance)
-        .limit(Math.max(limit * 5, minimumInfluencers * 5, 300))
+        .limit(Math.max(limit * 2, minimumInfluencers * 2, 80))
         .lean();
 
       return sortDiscoveryDataForSelectedFilters(
@@ -2345,31 +3169,42 @@ async function recommendInfluencersForCampaign(req, res) {
       );
     };
 
-    let candidateCreators = await loadCreators({ useKeyword: true, useCategory: true, useCountry: Boolean(country) });
+    const candidatePools = [];
+    const addCandidatePool = async (opts) => {
+      const rows = await loadCreators(opts);
+      if (Array.isArray(rows) && rows.length) candidatePools.push(...rows);
+      return uniqueRecommendedCreatorsByChannel(candidatePools).length;
+    };
 
-    if (candidateCreators.length < minimumInfluencers) {
-      candidateCreators = await loadCreators({ useKeyword: false, useCategory: true, useCountry: Boolean(country) });
+    await addCandidatePool({ useKeyword: true, useCategory: true, useCountry: Boolean(country) });
+
+    if (uniqueRecommendedCreatorsByChannel(candidatePools).length < minimumInfluencers) {
+      await addCandidatePool({ useKeyword: false, useCategory: true, useCountry: Boolean(country) });
+    }
+
+    if (uniqueRecommendedCreatorsByChannel(candidatePools).length < minimumInfluencers) {
+      // Last strict-country fallback: use all creators discovered/saved for this
+      // campaign, then let recommendation scoring decide the top 25. The Mongo
+      // filter still includes campaignId, so this does not pull random creators.
+      await addCandidatePool({ useKeyword: false, useCategory: false, useCountry: Boolean(country) });
     }
 
     // Never remove the country filter when strictCountry=true. This prevents India/Brazil/etc.
     // creators from being returned for a US campaign.
-    if (candidateCreators.length < minimumInfluencers && !hardCountry) {
-      candidateCreators = await loadCreators({ useKeyword: false, useCategory: true, useCountry: false });
+    if (uniqueRecommendedCreatorsByChannel(candidatePools).length < minimumInfluencers && !hardCountry) {
+      await addCandidatePool({ useKeyword: false, useCategory: true, useCountry: false });
     }
+
+    const candidateCreators = uniqueRecommendedCreatorsByChannel(candidatePools);
 
     const split = splitCreatorsByRecommendationFit(candidateCreators, campaignDetails, context);
-    let creators = sortRecommendedCreators([...split.exact]);
-
-    if (creators.length < minimumInfluencers) {
-      creators = sortRecommendedCreators([...creators, ...split.sameCountryRelevant]);
-    }
-
-    // Only use non-country creators when strictCountry is intentionally disabled by request.
-    if (creators.length < minimumInfluencers && !hardCountry) {
-      creators = sortRecommendedCreators([...creators, ...split.relevantOnly]);
-    }
-
-    creators = creators.slice(0, limit);
+    // Return max 50, tier-first. Exact selected-tier creators are prioritized.
+    // If exact-tier creators are not available, show same-country/category relevant creators
+    // instead of an empty invite page.
+    let creators = selectCampaignRecommendationCreatorsFromSplit(split, {
+      limit,
+      hardCountry,
+    });
 
     const savedCount = save
       ? await saveCampaignInfluencerRecommendations({
@@ -2379,41 +3214,18 @@ async function recommendInfluencersForCampaign(req, res) {
         })
       : 0;
 
-    return res.status(200).json({
-      success: true,
-      campaignId,
-      brandId: brandId || cleanStr(campaign.brandId),
-      minimumInfluencers,
-      requestedLimit: limit,
-      refreshedCount,
-      savedCount,
-      count: creators.length,
-      exactMatchCount: split.exact.length,
-      sameCountryRelevantCount: split.sameCountryRelevant.length,
-      strictCountry: hardCountry,
-      strictTierFirst: Boolean(campaignDetails.subscriberTier),
-      data: creators,
-      creators,
-      recommendations: creators,
-      recommendedCreators: creators,
-      campaignSearchContext: {
-        title: campaignDetails.rawCampaignTitle,
-        description: campaignDetails.rawCampaignDescription,
-        category: campaignDetails.rawCampaignCategory,
-        subcategory: campaignDetails.rawCampaignSubcategory,
-        country,
-        strictCountry: hardCountry,
-        subscriberTier: campaignDetails.subscriberTier,
-        minSubscribers: campaignDetails.minSubscribers,
-        maxSubscribers: campaignDetails.maxSubscribers,
-        keywords: campaignDetails.keywords,
-        recommendationSearchQueries: campaignDetails.recommendationSearchQueries,
-      },
-      warning:
-        creators.length < minimumInfluencers
-          ? `Only ${creators.length} creators matched the current campaign country/category/tier rules. No foreign-country filler creators were returned because strictCountry is enabled.`
-          : undefined,
-    });
+    return res.status(200).json(
+      buildResponse({
+        creators,
+        refreshedCount,
+        savedCount,
+        fromCache: false,
+        warning:
+          creators.length < minimumInfluencers
+            ? `Only ${creators.length} creators were found for this campaign. Exact selected-tier creators are shown first; remaining slots use same-country campaign-relevant creators from the Apps Script-style discovery flow. This endpoint is capped at ${limit}.`
+            : undefined,
+      })
+    );
   } catch (err) {
     await saveErrorLog(req, err, err?.status || 500, 'YOUTUBE_CAMPAIGN_RECOMMEND_INFLUENCERS');
     return res.status(err?.status || 500).json({
@@ -2422,6 +3234,8 @@ async function recommendInfluencersForCampaign(req, res) {
     });
   }
 }
+
+
 
 function uniqueCleanValues(values = []) {
   return Array.from(new Set((values || []).map((x) => cleanStr(x)).filter(Boolean)));
@@ -2776,6 +3590,93 @@ function attachTopLevelEmailToMediaKit(mediaKit = {}, cachedRecord = {}) {
   };
 }
 
+
+const MEDIA_KIT_DEFAULT_VIDEO_LIMIT = Math.max(
+  1,
+  Number(process.env.YOUTUBE_MEDIA_KIT_VIDEO_LIMIT || 12)
+);
+const MEDIA_KIT_MAX_VIDEO_LIMIT = Math.max(
+  MEDIA_KIT_DEFAULT_VIDEO_LIMIT,
+  Number(process.env.YOUTUBE_MEDIA_KIT_MAX_VIDEO_LIMIT || 20)
+);
+
+function resolveMediaKitVideoLimit(req) {
+  const requested = Number(req?.query?.maxVideos || req?.query?.videoLimit || 0);
+  const fallback = MEDIA_KIT_DEFAULT_VIDEO_LIMIT;
+
+  if (!Number.isFinite(requested) || requested <= 0) return fallback;
+
+  return Math.max(1, Math.min(MEDIA_KIT_MAX_VIDEO_LIMIT, Math.round(requested)));
+}
+
+function getFastMediaKitCreatorSnapshot(creator = {}, videoLimit = MEDIA_KIT_DEFAULT_VIDEO_LIMIT) {
+  const recentVideos = Array.isArray(creator.recentVideos)
+    ? creator.recentVideos.slice(0, videoLimit)
+    : [];
+
+  return {
+    ...(creator || {}),
+    recentVideos,
+    channelTags: Array.isArray(creator.channelTags)
+      ? creator.channelTags.slice(0, 20)
+      : [],
+    contact: {
+      ...(creator.contact || {}),
+      emails: Array.isArray(creator.contact?.emails)
+        ? creator.contact.emails.slice(0, 5)
+        : [],
+      totalEmails: Array.isArray(creator.contact?.totalEmails)
+        ? creator.contact.totalEmails.slice(0, 5)
+        : [],
+      socials: Array.isArray(creator.contact?.socials)
+        ? creator.contact.socials.slice(0, 10)
+        : [],
+      otherSocials: Array.isArray(creator.contact?.otherSocials)
+        ? creator.contact.otherSocials.slice(0, 10)
+        : [],
+      websites: Array.isArray(creator.contact?.websites)
+        ? creator.contact.websites.slice(0, 5)
+        : [],
+    },
+  };
+}
+
+function saveInfoMediaKitInBackground(req, channelId, creator, mediaKit) {
+  if (!InfoMediaKit || !channelId || !creator || !mediaKit) return;
+
+  const mediaKitEmailPayload = getMediaKitEmailPayload(mediaKit, creator);
+
+  InfoMediaKit.updateOne(
+    { channelId },
+    {
+      $set: {
+        platform: 'youtube',
+        channelId,
+        channelName: creator.channelName || mediaKit?.creatorOverview?.channelName || '',
+        channelUrl: creator.channelUrl || '',
+        thumbnail: creator.thumbnail || mediaKit?.creatorOverview?.profilePhoto || '',
+        country: creator.country || mediaKit?.creatorOverview?.country || '',
+        estimatedAudienceCountry:
+          creator.estimatedAudienceCountry || mediaKit?.creatorOverview?.estimatedAudienceCountry || '',
+        creatorTier: getTierFromSubscribers(creator.subscribers),
+        subscribers: Number(creator.subscribers || 0),
+        email: mediaKitEmailPayload.email,
+        emails: mediaKitEmailPayload.emails,
+        website: mediaKitEmailPayload.website,
+        socialLinks: mediaKitEmailPayload.socialLinks,
+        mediaKitData: mediaKit,
+        rawCreatorSnapshot: getFastMediaKitCreatorSnapshot(creator, MEDIA_KIT_DEFAULT_VIDEO_LIMIT),
+        lastOpenedAt: new Date(),
+      },
+      $inc: { openCount: 1 },
+      $setOnInsert: { createdAt: new Date() },
+    },
+    { upsert: true }
+  ).catch((saveErr) => {
+    saveErrorLog(req, saveErr, saveErr?.status || 500, 'INFOMEDIAKIT_SAVE_FAILED').catch(() => {});
+  });
+}
+
 async function getCreatorMediaKit(req, res) {
   try {
     const channelId = cleanStr(req.params.channelId);
@@ -2783,8 +3684,10 @@ async function getCreatorMediaKit(req, res) {
       return res.status(400).json({ success: false, error: 'channelId is required' });
     }
 
-    // First return saved media kit data from the new infomediakit collection.
-    // This does not save brandId/userId/who opened it. One saved media kit is shared for future opens.
+    const videoLimit = resolveMediaKitVideoLimit(req);
+
+    // First return saved media kit data from the infomediakit collection.
+    // This keeps Media Kit clicks fast and avoids rebuilding the same report.
     if (InfoMediaKit) {
       const cachedMediaKit = await InfoMediaKit.findOne({ channelId }).lean();
       if (cachedMediaKit?.mediaKitData) {
@@ -2805,6 +3708,8 @@ async function getCreatorMediaKit(req, res) {
           success: true,
           data: cachedData,
           fromCache: true,
+          fastMode: true,
+          videoLimit,
         });
       }
     }
@@ -2818,52 +3723,25 @@ async function getCreatorMediaKit(req, res) {
       country: cleanStr(req.query.country),
     };
 
+    // Build from the already saved creator snapshot only. No fresh YouTube/OpenAI
+    // enrichment is done on Media Kit click. This keeps first response fast while
+    // still using relevant recent-video, score, contact, tier, country, and topic data.
+    const fastCreator = getFastMediaKitCreatorSnapshot(creator, videoLimit);
     const mediaKit = attachTopLevelEmailToMediaKit(
-      buildBrandMediaKitData(creator, context),
+      buildBrandMediaKitData(fastCreator, context),
       {}
     );
-    const mediaKitEmailPayload = getMediaKitEmailPayload(mediaKit, creator);
 
-    // Save generated media kit in infomediakit table for next open.
-    // No brandId/userId is stored here.
-    if (InfoMediaKit) {
-      try {
-        await InfoMediaKit.updateOne(
-          { channelId },
-          {
-            $set: {
-              platform: 'youtube',
-              channelId,
-              channelName: creator.channelName || mediaKit?.creatorOverview?.channelName || '',
-              channelUrl: creator.channelUrl || '',
-              thumbnail: creator.thumbnail || mediaKit?.creatorOverview?.profilePhoto || '',
-              country: creator.country || mediaKit?.creatorOverview?.country || '',
-              estimatedAudienceCountry:
-                creator.estimatedAudienceCountry || mediaKit?.creatorOverview?.estimatedAudienceCountry || '',
-              creatorTier: getTierFromSubscribers(creator.subscribers),
-              subscribers: Number(creator.subscribers || 0),
-              email: mediaKitEmailPayload.email,
-              emails: mediaKitEmailPayload.emails,
-              website: mediaKitEmailPayload.website,
-              socialLinks: mediaKitEmailPayload.socialLinks,
-              mediaKitData: mediaKit,
-              rawCreatorSnapshot: creator,
-              lastOpenedAt: new Date(),
-            },
-            $inc: { openCount: 1 },
-            $setOnInsert: { createdAt: new Date() },
-          },
-          { upsert: true }
-        );
-      } catch (saveErr) {
-        await saveErrorLog(req, saveErr, saveErr?.status || 500, 'INFOMEDIAKIT_SAVE_FAILED');
-      }
-    }
+    // Save generated media kit in background for the next open.
+    // Do not block the UI response on this write.
+    saveInfoMediaKitInBackground(req, channelId, fastCreator, mediaKit);
 
     return res.status(200).json({
       success: true,
       data: mediaKit,
       fromCache: false,
+      fastMode: true,
+      videoLimit,
     });
   } catch (err) {
     await saveErrorLog(req, err, err?.status || 500, 'YOUTUBE_BRAND_MEDIA_KIT');
@@ -2932,4 +3810,5 @@ module.exports = {
   getCreatorMediaKit,
   proxyImage,
   recommendInfluencersForCampaign,
+  getYouTubeDiscoveryJob,
 };
