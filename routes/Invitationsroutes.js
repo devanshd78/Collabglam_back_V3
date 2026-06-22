@@ -8,7 +8,9 @@ const {
   getInvitationList,
   getInvitationSendEligibility,
   sendInvitationFollowUp,
-  getAllInvitations
+  getAllInvitations,
+  getAllMissingEmailRecords,
+  updateInfluencerEmailByChannelId
 } = require("../controllers/NewInvitationsController");
 
 router.post("/create", createInvitation);
@@ -18,5 +20,10 @@ router.post("/getList", getInvitationList);
 router.post("/eligibility", getInvitationSendEligibility);
 router.post("/followup", sendInvitationFollowUp);
 router.post("/getall", getAllInvitations);
+router.get("/getAllMissing", getAllMissingEmailRecords);
+router.post(
+  "/missing-email-records/:channelId/email",
+  updateInfluencerEmailByChannelId
+);
 
 module.exports = router;

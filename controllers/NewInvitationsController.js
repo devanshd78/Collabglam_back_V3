@@ -784,6 +784,28 @@ function applyInvitationUpdates(doc, payload = {}) {
   return changed;
 }
 
+async function deleteMissingEmailByChannelId({ channelId }) {
+  const normalizedChannelId = String(channelId || "").trim();
+
+  if (!normalizedChannelId) {
+    return {
+      deletedCount: 0,
+    };
+  }
+
+  const result = await MissingEmail.deleteMany({
+    platform: "youtube",
+    $or: [
+      { channelId: normalizedChannelId },
+      { "youtube.channelId": normalizedChannelId },
+    ],
+  });
+
+  return {
+    deletedCount: result.deletedCount || 0,
+  };
+}
+
 exports.createInvitation = async (req, res) => {
   try {
     const brandId = normalizeObjectId(req.body?.brandId);
@@ -912,14 +934,14 @@ exports.createInvitation = async (req, res) => {
     let updatedCount = 0;
     let emailSentCount = 0;
 
-    for (const campaignId of campaignIds) {
-      const campaign = campaignMap.get(String(campaignId));
-      const campaignName = getCampaignName(campaign, req.body?.campaignName);
+    // If email is not found, do NOT create invitation.
+    // Only save/update MissingEmail record.
+    if (!recipientEmail) {
+      for (const campaignId of campaignIds) {
+        const campaign = campaignMap.get(String(campaignId));
+        const campaignName = getCampaignName(campaign, req.body?.campaignName);
 
-      let missingEmail = null;
-
-      if (!recipientEmail) {
-        missingEmail = await ensureMissingEmailRecord({
+        const missingEmail = await ensureMissingEmailRecord({
           handle,
           platform,
           channelId,
@@ -939,9 +961,62 @@ exports.createInvitation = async (req, res) => {
         ) {
           missingRecords.push(missingEmail);
         }
+
+        results.push({
+          status: "pending_email_resolution",
+          message:
+            "Email not found. MissingEmail record created/updated. Invitation was not created.",
+          emailSent: false,
+          emailMeta: null,
+          emailSkippedReason:
+            "Email not found in InfoMediaKit. Invitation was not saved because emailTo is missing.",
+          data: {
+            handle,
+            platform,
+            channelId,
+            brandId,
+            campaignId,
+            campaignName,
+            missingEmail,
+          },
+        });
       }
 
-      const emailToValue = recipientEmail || handle;
+      const multipleCampaigns = campaignIds.length > 1;
+
+      return res.status(200).json({
+        status: "pending_email_resolution",
+        message:
+          "Email not found in InfoMediaKit. MissingEmail was created/updated, but invitation was not saved.",
+        handle,
+        platform,
+        channelId,
+        emailSource,
+        createdCount: 0,
+        existingCount: 0,
+        updatedCount: 0,
+        emailSentCount: 0,
+        emailSent: false,
+        missingEmailCount: missingRecords.length,
+        emailMeta: null,
+        emailSkippedReason:
+          "Email not found. Invitation was not created because emailTo is missing.",
+        data: multipleCampaigns
+          ? results.map((item) => item.data)
+          : results[0]?.data || null,
+        missingEmails:
+          missingRecords.length === 1 ? missingRecords[0] : missingRecords,
+        results,
+      });
+    }
+
+    for (const campaignId of campaignIds) {
+      const campaign = campaignMap.get(String(campaignId));
+      const campaignName = getCampaignName(campaign, req.body?.campaignName);
+
+      let missingEmail = null;
+
+      const emailToValue = recipientEmail;
 
       const payload = buildInvitationPayload({
         handle,
@@ -1015,6 +1090,7 @@ exports.createInvitation = async (req, res) => {
               doc.emailSentAt = new Date();
 
               await doc.save();
+              await deleteMissingEmailByChannelId({ channelId });
             }
 
             emailMeta = {
@@ -1036,7 +1112,7 @@ exports.createInvitation = async (req, res) => {
         }
       } else {
         emailSkippedReason =
-          "Influencer email is not available in InfoMediaKit. Invitation saved and linked with MissingEmail.";
+          "Invitation Send Succefully";
       }
 
       results.push({
@@ -1131,9 +1207,11 @@ exports.sendInvitationFollowUp = async (req, res) => {
     const campaignId = normalizeObjectId(req.body?.campaignId);
 
     const rawHandle = String(req.body?.handle || "").trim();
-    const rawPlatform = String(req.body?.platform || "youtube").trim();
     const channelId = getRequestChannelId(req);
     const userId = normalizeInfluencerUserId(req.body);
+
+    // Fixed platform
+    const platform = "youtube";
 
     if (!brandId) {
       return res.status(400).json({
@@ -1149,13 +1227,6 @@ exports.sendInvitationFollowUp = async (req, res) => {
       });
     }
 
-    if (!rawHandle) {
-      return res.status(400).json({
-        status: "error",
-        message: "handle is required.",
-      });
-    }
-
     if (!channelId) {
       return res.status(400).json({
         status: "error",
@@ -1163,21 +1234,12 @@ exports.sendInvitationFollowUp = async (req, res) => {
       });
     }
 
-    const handle = normalizeHandle(rawHandle);
+    const handle = rawHandle ? normalizeHandle(rawHandle) : "";
 
-    if (!HANDLE_RX.test(handle)) {
+    if (handle && !HANDLE_RX.test(handle)) {
       return res.status(400).json({
         status: "error",
         message: "Invalid handle format.",
-      });
-    }
-
-    const platform = normalizePlatform(rawPlatform);
-
-    if (!platform || !PLATFORM_ENUM.has(platform)) {
-      return res.status(400).json({
-        status: "error",
-        message: "Invalid platform. Only youtube is supported.",
       });
     }
 
@@ -1203,19 +1265,38 @@ exports.sendInvitationFollowUp = async (req, res) => {
       });
     }
 
+    const invitationOr = [
+      { channelId },
+      { userId: channelId }, // legacy support: old rows stored YouTube channelId in userId
+    ];
+
+    if (handle) {
+      invitationOr.push({ handle });
+    }
+
+    if (req.body?.invitationId && normalizeObjectId(req.body.invitationId)) {
+      invitationOr.push({ _id: toObjectId(req.body.invitationId) });
+    }
+
     const doc = await Invitation.findOne({
       brandId,
       campaignId,
-      handle,
       platform,
-      channelId,
+      $or: invitationOr,
     });
 
     if (!doc) {
       return res.status(404).json({
         status: "error",
         message:
-          "Invitation not found. Send the invitation first before follow-up.",
+          "Invitation not found for this brand, campaign and channelId. Send the invitation first before follow-up.",
+        lookup: {
+          brandId,
+          campaignId,
+          platform,
+          channelId,
+          handle: handle || null,
+        },
       });
     }
 
@@ -1227,17 +1308,24 @@ exports.sendInvitationFollowUp = async (req, res) => {
       });
     }
 
+    const resolvedHandle = doc.handle || handle || "";
+    const resolvedChannelId = getInvitationChannelId(doc) || channelId;
+
     const directEmailFromInvitation = cleanEmail(doc.emailTo);
 
     let recipientEmail = directEmailFromInvitation;
     let emailSource = directEmailFromInvitation
       ? "invitation_email_to"
       : "email_not_found";
+
     let infoMediaKit = null;
     let missingEmail = null;
 
     if (!recipientEmail) {
-      const infoResult = await findEmailInInfoMediaKit({ channelId });
+      const infoResult = await findEmailInInfoMediaKit({
+        channelId: resolvedChannelId,
+      });
+
       recipientEmail = cleanEmail(infoResult.email);
       emailSource = infoResult.source;
       infoMediaKit = infoResult.doc || null;
@@ -1246,9 +1334,9 @@ exports.sendInvitationFollowUp = async (req, res) => {
     if (!recipientEmail) {
       missingEmail = await resolveMissingEmailDoc({
         missingEmailId: doc.missingEmailId || req.body?.missingEmailId,
-        handle,
+        handle: resolvedHandle,
         platform,
-        channelId,
+        channelId: resolvedChannelId,
       });
 
       recipientEmail = cleanEmail(missingEmail?.email);
@@ -1259,10 +1347,10 @@ exports.sendInvitationFollowUp = async (req, res) => {
       return res.status(400).json({
         status: "error",
         message:
-          "Influencer email not found in InfoMediaKit or MissingEmail. Please resolve missing email first.",
-        handle,
+          "Influencer email not found in invitation, InfoMediaKit or MissingEmail. Please resolve missing email first.",
+        handle: resolvedHandle,
         platform,
-        channelId,
+        channelId: resolvedChannelId,
       });
     }
 
@@ -1285,13 +1373,14 @@ exports.sendInvitationFollowUp = async (req, res) => {
       brandId,
       campaignId,
       platform,
-      handle,
-      channelId,
+      handle: resolvedHandle,
+      channelId: resolvedChannelId,
       type: "creator-followup",
     });
 
     doc.status = "invited";
     doc.userId = userId || doc.userId || null;
+    doc.channelId = resolvedChannelId;
 
     if (missingEmail?._id) {
       doc.missingEmailId = String(missingEmail._id);
@@ -1318,7 +1407,7 @@ exports.sendInvitationFollowUp = async (req, res) => {
         subject: emailTemplate.subject,
         from: emailTemplate.from,
         campaignId,
-        channelId,
+        channelId: resolvedChannelId,
       },
       data: invitationResponse(doc, {
         brand,
@@ -2261,6 +2350,360 @@ exports.getAllInvitations = async (req, res) => {
       err?.statusCode || err?.status || 500,
       "GET_ALL_INVITATIONS_ERROR"
     );
+
+    return res.status(500).json({
+      status: "error",
+      message: err?.message || "Internal server error.",
+    });
+  }
+};
+
+
+function getMissingEmailChannelId(doc = {}) {
+  return (
+    String(doc.channelId || "").trim() ||
+    String(doc.youtube?.channelId || "").trim() ||
+    ""
+  );
+}
+
+exports.getAllMissingEmailRecords = async (req, res) => {
+  try {
+    const body = {
+      ...(req.query || {}),
+      ...(req.body || {}),
+    };
+
+    const page = Math.max(1, parseInt(body.page ?? "1", 10));
+    const limit = Math.min(200, Math.max(1, parseInt(body.limit ?? "50", 10)));
+
+    const rawStatus = String(body.status || "").trim().toLowerCase();
+    const rawSearch = String(body.search || "").trim();
+    const rawChannelId = String(body.channelId || body.youtubeChannelId || "").trim();
+    const platform = "youtube";
+    const andQuery = [{ platform }];
+
+    if (rawStatus && rawStatus !== "all") {
+      andQuery.push({ status: rawStatus });
+    }
+
+    if (rawChannelId) {
+      andQuery.push({
+        $or: [
+          { channelId: rawChannelId },
+          { "youtube.channelId": rawChannelId },
+        ],
+      });
+    }
+
+    if (rawSearch) {
+      const rx = new RegExp(escapeRegExp(rawSearch), "i");
+
+      const searchOr = [
+        { email: rx },
+        { handle: rx },
+        { platform: rx },
+        { status: rx },
+        { channelId: rx },
+        { "youtube.channelId": rx },
+        { "campaigns.campaignName": rx },
+        { "campaigns.channelId": rx },
+        { "campaigns.brandId": rx },
+        { "campaigns.campaignId": rx },
+      ];
+
+      if (isObjectId(rawSearch)) {
+        searchOr.push({ _id: toObjectId(rawSearch) });
+      }
+
+      andQuery.push({ $or: searchOr });
+    }
+
+    const query = andQuery.length ? { $and: andQuery } : {};
+
+    const [total, missingRecords] = await Promise.all([
+      MissingEmail.countDocuments(query),
+      MissingEmail.find(query)
+        .sort({ updatedAt: -1, createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
+    ]);
+
+    const channelIds = [
+      ...new Set(
+        missingRecords
+          .map((item) => getMissingEmailChannelId(item))
+          .filter(Boolean)
+      ),
+    ];
+
+    const infoMediaKits = channelIds.length
+      ? await InfoMediaKit.find({
+        channelId: { $in: channelIds },
+        platform: /^youtube$/i,
+      }).lean()
+      : [];
+
+    const infoMap = new Map(
+      infoMediaKits.map((item) => [String(item.channelId), item])
+    );
+
+    const data = missingRecords.map((missing) => {
+      const channelId = getMissingEmailChannelId(missing);
+      const info = infoMap.get(channelId) || null;
+
+      const email =
+        cleanEmail(missing.email) ||
+        cleanEmail(info?.email) ||
+        null;
+
+      return {
+        _id: String(missing._id),
+        missingEmailId: missing.missingEmailId || null,
+        handle: missing.handle || "",
+        platform: missing.platform || "youtube",
+        channelId: channelId || null,
+        email,
+        status: missing.status || "",
+        campaigns: missing.campaigns || [],
+        createdByAdminId: missing.createdByAdminId || null,
+
+        infoMediaKit: info
+          ? {
+            _id: String(info._id),
+            platform: info.platform || "youtube",
+            channelId: info.channelId || channelId || null,
+            channelName: info.channelName || "",
+            channelUrl: info.channelUrl || "",
+            thumbnail: info.thumbnail || "",
+            country: info.country || "",
+            creatorTier: info.creatorTier || "",
+            subscribers: info.subscribers || 0,
+            email: info.email || "",
+            emails: info.emails || [],
+          }
+          : null,
+
+        createdAt: missing.createdAt || null,
+        updatedAt: missing.updatedAt || null,
+      };
+    });
+
+    return res.status(200).json({
+      status: "success",
+      message: data.length
+        ? "Missing email records fetched successfully."
+        : "No missing email records found.",
+      page,
+      limit,
+      total,
+      hasNext: page * limit < total,
+      data,
+    });
+  } catch (err) {
+    console.error("getAllMissingEmailRecords error:", err);
+
+    await saveErrorLog(
+      req,
+      err,
+      err?.statusCode || err?.status || 500,
+      "GET_ALL_MISSING_EMAIL_RECORDS_ERROR"
+    );
+
+    return res.status(500).json({
+      status: "error",
+      message: err?.message || "Internal server error.",
+    });
+  }
+};
+
+exports.updateInfluencerEmailByChannelId = async (req, res) => {
+  try {
+    const channelId = String(
+      req.params?.channelId ||
+      req.body?.channelId ||
+      req.body?.youtubeChannelId ||
+      req.query?.channelId ||
+      ""
+    ).trim();
+
+    const email = cleanEmail(
+      req.body?.email ||
+      req.body?.businessEmail ||
+      req.body?.contactEmail ||
+      ""
+    );
+
+    // Fixed platform. Do not take platform from body.
+    const platform = "youtube";
+
+    const rawHandle = String(req.body?.handle || "").trim();
+    const handle = rawHandle ? normalizeHandle(rawHandle) : "";
+
+    if (!channelId) {
+      return res.status(400).json({
+        status: "error",
+        message: "channelId is required.",
+      });
+    }
+
+    if (!email) {
+      return res.status(400).json({
+        status: "error",
+        message: "Valid email is required.",
+      });
+    }
+
+    if (handle && !HANDLE_RX.test(handle)) {
+      return res.status(400).json({
+        status: "error",
+        message:
+          'Invalid handle. It must start with "@" and contain letters, numbers, ".", "_" or "-".',
+      });
+    }
+
+    const missingMatch = {
+      platform,
+      $or: [{ channelId }, { "youtube.channelId": channelId }],
+    };
+
+    const missingSet = {
+      email,
+      status: "resolved",
+      platform,
+      channelId,
+    };
+
+    if (handle) {
+      missingSet.handle = handle;
+    }
+
+    const missingBefore = await MissingEmail.find(missingMatch)
+      .select("_id")
+      .lean();
+
+    const missingUpdateResult = await MissingEmail.updateMany(missingMatch, {
+      $set: missingSet,
+    });
+
+    let missingRecords = await MissingEmail.find(missingMatch).lean();
+    let createdMissingRecord = false;
+
+    if (!missingRecords.length && handle) {
+      const created = await MissingEmail.create({
+        email,
+        handle,
+        platform,
+        channelId,
+        status: "resolved",
+        campaigns: [],
+        createdByAdminId: req.body?.createdByAdminId || null,
+      });
+
+      createdMissingRecord = true;
+      missingRecords = [created.toObject()];
+    }
+
+    const infoSet = {
+      platform,
+      channelId,
+      email,
+    };
+
+    if (req.body?.channelName !== undefined) {
+      infoSet.channelName = String(req.body.channelName || "").trim();
+    }
+
+    if (req.body?.channelUrl !== undefined) {
+      infoSet.channelUrl = String(req.body.channelUrl || "").trim();
+    }
+
+    if (req.body?.thumbnail !== undefined) {
+      infoSet.thumbnail = String(req.body.thumbnail || "").trim();
+    }
+
+    if (req.body?.country !== undefined) {
+      infoSet.country = String(req.body.country || "").trim();
+    }
+
+    if (req.body?.creatorTier !== undefined) {
+      infoSet.creatorTier = String(req.body.creatorTier || "").trim();
+    }
+
+    if (req.body?.subscribers !== undefined) {
+      const subscribers = Number(req.body.subscribers);
+      if (Number.isFinite(subscribers)) {
+        infoSet.subscribers = subscribers;
+      }
+    }
+
+    const infoMediaKit = await InfoMediaKit.findOneAndUpdate(
+      { channelId },
+      {
+        $set: infoSet,
+        $addToSet: {
+          emails: email,
+        },
+      },
+      {
+        new: true,
+        upsert: true,
+        setDefaultsOnInsert: true,
+      }
+    ).lean();
+
+    const invitationUpdateResult = await Invitation.updateMany(
+      {
+        platform,
+        channelId,
+      },
+      {
+        $set: {
+          emailTo: email,
+        },
+      }
+    );
+
+    return res.status(200).json({
+      status: "success",
+      message: "Influencer email updated in MissingEmail and InfoMediaKit.",
+      channelId,
+      platform,
+      email,
+      createdMissingRecord,
+      missingEmailMatchedCount: missingBefore.length,
+      missingEmailModifiedCount:
+        missingUpdateResult.modifiedCount ?? missingUpdateResult.nModified ?? 0,
+      invitationModifiedCount:
+        invitationUpdateResult.modifiedCount ??
+        invitationUpdateResult.nModified ??
+        0,
+      data: {
+        missingRecords,
+        infoMediaKit,
+      },
+    });
+  } catch (err) {
+    console.error("updateInfluencerEmailByChannelId error:", err);
+
+    const statusCode =
+      err?.code === 11000 ? 409 : err?.statusCode || err?.status || 500;
+
+    await saveErrorLog(
+      req,
+      err,
+      statusCode,
+      "UPDATE_INFLUENCER_EMAIL_BY_CHANNEL_ID_ERROR"
+    );
+
+    if (err?.code === 11000) {
+      return res.status(409).json({
+        status: "error",
+        message: "Duplicate record conflict while updating influencer email.",
+        duplicateKey: err.keyValue || null,
+      });
+    }
 
     return res.status(500).json({
       status: "error",
